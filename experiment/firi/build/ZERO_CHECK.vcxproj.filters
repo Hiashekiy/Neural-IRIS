@@ -1,0 +1,13 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup>
+    <CustomBuild Include="D:\ProjectDirectory\GGMPC-dev\CorridorConstraints-running\experiment\firi\build\CMakeFiles\be363782230471cde674c40e2c0608de\generate.stamp.rule">
+      <Filter>CMake Rules</Filter>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <Filter Include="CMake Rules">
+      <UniqueIdentifier>{97808DFE-5D52-3746-BC0C-810FE6B94153}</UniqueIdentifier>
+    </Filter>
+  </ItemGroup>
+</Project>

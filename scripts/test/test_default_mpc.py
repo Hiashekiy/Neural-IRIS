@@ -30,8 +30,7 @@ project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
-from src.rl_envs.tuning_env import TuningEnv
-from src.utils.obstacle_wrapper import StaticObstacleWrapper
+from src.planner.mpc_env import MPCEnv
 
 
 def load_map(map_path: str) -> np.ndarray:
@@ -65,19 +64,10 @@ def load_map(map_path: str) -> np.ndarray:
     return map_obstacle
 
 
-def make_test_env(map_obstacle: np.ndarray,
-                  use_obstacles: bool = False,
-                  density: float = 0.5):
-    env = TuningEnv(map_obstacle=map_obstacle, input_resolution=0.25, max_steps=1000, path_mode='train')
-    if use_obstacles:
-        env = StaticObstacleWrapper(
-            env,
-            density=density,
-            min_obs_radius=0.5,
-            max_obs_radius=2.0,
-            passage_width=3.5,
-        )
-        print(f"[ObstacleWrapper] 已启用 density={density}")
+def make_test_env(map_obstacle: np.ndarray, use_obstacles: bool = False, density: float = 0.5):
+    env = MPCEnv(map_obstacle=map_obstacle.copy(), input_resolution=0.25, max_steps=1000, path_mode='train')
+    env.use_obstacles = use_obstacles
+    env.obs_density = density
     return env
 
 
@@ -86,18 +76,24 @@ def render_step(render_objs, base_env, action_physical, traj_x, traj_y, velociti
     res = base_env.INTERNAL_RESOLUTION
     
     if len(traj_x) > 1:
-        offsets = np.c_[np.array(traj_x) / res, np.array(traj_y) / res]
-        render_objs['traj_scatter'].set_offsets(offsets)
-        render_objs['traj_scatter'].set_array(np.array(velocities))
+        pts = np.c_[np.array(traj_x) / res, np.array(traj_y) / res].reshape(-1, 1, 2)
+        segments = np.concatenate([pts[:-1], pts[1:]], axis=1)
+        render_objs['traj_line'].set_segments(segments)
+        render_objs['traj_line'].set_array(np.array(velocities[:-1]))
 
     state = base_env.state
     cx, cy = state[0] / res, state[1] / res
     heading = state[2]
+    import json
+    config_path = os.path.join(project_root, 'config', 'config.json')
+    with open(config_path, 'r', encoding='utf-8') as f:
+        cfg = json.load(f)['vehicle_parameters']
     
-    L = 1.0 / res
-    W = 0.5 / res
-    rear_overhang = 0.5 / res
-    front_overhang = 0.5 / res
+    L = cfg['wheelbase_m'] / res
+    W = cfg['car_width_m'] / res
+    rear_overhang = (cfg['car_length_m'] - cfg['wheelbase_m'] - cfg['overhang_front_m']) / res
+    front_overhang = cfg['overhang_front_m'] / res
+
     
     fl = (L + front_overhang, W / 2)
     fr = (L + front_overhang, -W / 2)
@@ -112,6 +108,36 @@ def render_step(render_objs, base_env, action_physical, traj_x, traj_y, velociti
     pts_rot[:, 1] += cy
     
     render_objs['car_patch'].set_xy(pts_rot)
+
+    wl = cfg.get('wheel_length_m', 0.35) / res
+    ww = cfg.get('wheel_width_m', 0.15) / res
+    wi = cfg.get('wheel_inset_m', 0.15) / res
+
+    w_y = W / 2 - wi
+    steer = state[4] if len(state) > 4 else 0.0
+
+    w_pts = np.array([
+        [wl / 2, ww / 2],
+        [wl / 2, -ww / 2],
+        [-wl / 2, -ww / 2],
+        [-wl / 2, ww / 2]
+    ])
+
+    def get_wheel(w_cx, w_cy, w_angle):
+        cw, sw = np.cos(w_angle), np.sin(w_angle)
+        R_w = np.array([[cw, -sw], [sw, cw]])
+        pts_w = w_pts @ R_w.T
+        pts_w[:, 0] += w_cx
+        pts_w[:, 1] += w_cy
+        pts_w_world = pts_w @ rot.T
+        pts_w_world[:, 0] += cx
+        pts_w_world[:, 1] += cy
+        return pts_w_world
+
+    render_objs['wheel_fl'].set_xy(get_wheel(L, w_y, steer))
+    render_objs['wheel_fr'].set_xy(get_wheel(L, -w_y, steer))
+    render_objs['wheel_rl'].set_xy(get_wheel(0, w_y, 0.0))
+    render_objs['wheel_rr'].set_xy(get_wheel(0, -w_y, 0.0))
 
     al = 4.0 / res
     render_objs['car_arrow'].xy = (cx + al * np.cos(heading), cy + al * np.sin(heading))
@@ -197,22 +223,28 @@ def render_step(render_objs, base_env, action_physical, traj_x, traj_y, velociti
             render_objs['cbf_text'].set_text(text_str)
             render_objs['cbf_text'].set_color('green')
 
-    cnn_img = base_env._get_local_map_cnn(state[:2], heading)[0]
-    render_objs['cnn_img'].set_data(cnn_img)
-
-    if action_physical is not None:
-        for bar, text, val in zip(render_objs['bars'], render_objs['bar_texts'], action_physical):
-            bar.set_height(val)
-            text.set_text(f'{val:.1f}')
-            text.set_position((bar.get_x() + bar.get_width() / 2, val + 0.05))
-
     render_objs['fig'].canvas.draw_idle()
     render_objs['fig'].canvas.flush_events()
     plt.pause(0.001)
 
 
 def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: int, save_video: bool = False):
-    obs, info = env.reset()
+    info = env.reset()
+
+    if getattr(base_env, 'use_obstacles', False) and base_env.poly_points_np is not None:
+        path_pts = base_env.poly_points_np
+        res = base_env.INTERNAL_RESOLUTION
+        h, w = base_env.map_obstacle.shape
+        num_obs = int(len(path_pts) * base_env.obs_density / 20)
+        num_obs = max(1, num_obs)
+        for _ in range(num_obs):
+            idx = np.random.randint(len(path_pts) // 5, len(path_pts) * 4 // 5)
+            cx, cy = int(path_pts[idx][0] / res), int(path_pts[idx][1] / res)
+            r = np.random.randint(2, 6)
+            y, x = np.ogrid[-cy:h-cy, -cx:w-cx]
+            mask = x*x + y*y <= r*r
+            base_env.map_obstacle[mask] = 1
+        print(f'[Obstacles] 已在轨迹上植入 {num_obs} 个随机障碍物')
 
     episode_map  = base_env.map_obstacle.copy()
     episode_path = base_env.poly_points_np.copy() if base_env.poly_points_np is not None else None
@@ -232,9 +264,8 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
     render_objs = {}
     if render:
         plt.ion()
-        fig, (ax_m, ax_c, ax_a) = plt.subplots(
-            1, 3, figsize=(18, 7),
-            gridspec_kw={'width_ratios': [3, 1, 1]})
+        # Keep window size similar to before, e.g., figsize=(10, 10) instead of 18,7
+        fig, ax_m = plt.subplots(1, 1, figsize=(10, 10))
         plt.tight_layout()
 
         res = base_env.INTERNAL_RESOLUTION
@@ -248,7 +279,10 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
             ax_m.plot(sp[0] / res, sp[1] / res, 'g^', markersize=10, label='Start')
             ax_m.plot(tp[0] / res, tp[1] / res, 'r*', markersize=12, label='Goal')
 
-        traj_scatter = ax_m.scatter([], [], c=[], cmap='jet', vmin=0, vmax=8, s=6, zorder=10)
+        from matplotlib.collections import LineCollection
+        import matplotlib.colors as mcolors
+        traj_line = LineCollection([], cmap='jet', norm=mcolors.Normalize(vmin=0, vmax=8), linewidth=3.0, zorder=10)
+        ax_m.add_collection(traj_line)
         
         pred_line, = ax_m.plot([], [], color='m', linestyle='-', linewidth=2, alpha=0.8, label='MPC Pred')
 
@@ -264,6 +298,14 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
 
         car_patch = Polygon(np.zeros((4, 2)), closed=True, edgecolor='black', facecolor='cyan', zorder=15, alpha=0.8)
         ax_m.add_patch(car_patch)
+        wheel_fl = Polygon(np.zeros((4, 2)), closed=True, edgecolor='none', facecolor='black', zorder=16)
+        wheel_fr = Polygon(np.zeros((4, 2)), closed=True, edgecolor='none', facecolor='black', zorder=16)
+        wheel_rl = Polygon(np.zeros((4, 2)), closed=True, edgecolor='none', facecolor='black', zorder=16)
+        wheel_rr = Polygon(np.zeros((4, 2)), closed=True, edgecolor='none', facecolor='black', zorder=16)
+        ax_m.add_patch(wheel_fl)
+        ax_m.add_patch(wheel_fr)
+        ax_m.add_patch(wheel_rl)
+        ax_m.add_patch(wheel_rr)
         car_arrow = ax_m.annotate('', xy=(0,0), xytext=(0,0), arrowprops=dict(arrowstyle='->', color='red', lw=2))
         title_m = ax_m.set_title(status, fontsize=11)
         
@@ -273,37 +315,20 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
 
         ax_m.legend(loc='upper right', fontsize=8)
 
-        dummy_cnn = np.zeros((64, 64))
-        cnn_img_plot = ax_c.imshow(dummy_cnn, cmap='gray', vmin=0, vmax=255, origin='upper')
-        sz = 64
-        ax_c.plot(sz / 2, sz * 0.8, 'r^', markersize=10)
-        ax_c.set_title("CNN Input (64x64)", fontsize=10)
-        ax_c.axis('off')
-
-        labels  = ['v_ref', 'w_lat', 'w_lon', 'w_hdg', 'w_vel']
-        colors  = ['#4C72B0', '#DD8452', '#55A868', '#C44E52', '#8172B3']
-
-        bars = ax_a.bar(labels, fixed_action, color=colors, alpha=0.85)
-        bar_texts = [ax_a.text(b.get_x() + b.get_width() / 2, val + 0.05, f'{val:.1f}', ha='center', va='bottom', fontsize=8) for b, val in zip(bars, fixed_action)]
-        ax_a.set_ylim(0, max(11, fixed_action.max() + 2))
-        ax_a.set_title("Fixed MPC Params", fontsize=10)
-        ax_a.set_ylabel('Value')
-        ax_a.tick_params(axis='x', labelsize=8, rotation=45)
-
         render_objs = {
             'fig': fig, 'ax_m': ax_m,
-            'traj_scatter': traj_scatter, 'car_patch': car_patch, 
+            'traj_line': traj_line, 'car_patch': car_patch, 
             'pred_line': pred_line,       
             'poly_patches': poly_patches, 
             'ell_patches': ell_patches,   
             'cbf_text': cbf_text,       
             'car_arrow': car_arrow, 'title_m': title_m,
-            'cnn_img': cnn_img_plot,
-            'bars': bars, 'bar_texts': bar_texts
+            'wheel_fl': wheel_fl, 'wheel_fr': wheel_fr,
+            'wheel_rl': wheel_rl, 'wheel_rr': wheel_rr
         }
 
     while not done:
-        obs, reward, terminated, truncated, infos = env.step(fixed_action)
+        terminated, truncated, infos = env.step(fixed_action)
         done = terminated or truncated
         step += 1
         if 'time_stats' in infos:
@@ -437,13 +462,17 @@ def main():
     parser.add_argument('--obstacles', action='store_true', help='启用静态随机障碍物')
     parser.add_argument('--density', type=float, default=1, help='障碍物采样密度 [0,1]，默认 0.5')
     parser.add_argument('--v-ref', type=float, default=10.0, help='指定基线测试的目标车速 v_ref')
+    parser.add_argument('--w-obs', type=float, default=4.0, help='避障权重乘子')
+    parser.add_argument('--r-inf', type=float, default=1.0, help='障碍影响半径 R_influence')
+    parser.add_argument('--w-lat', type=float, default=20.0, help='横向跟踪权重乘子')
+    parser.add_argument('--w-steer', type=float, default=1.0, help='方向盘变化率惩罚权重')
     parser.add_argument('--save-video', action='store_true', help='是否保存视频')
     args = parser.parse_args()
 
     render = not args.no_render
     save_video = args.save_video
 
-    map_dir = os.path.join(project_root, 'data', 'street-map')
+    map_dir = os.path.join(project_root, 'data', 'street-map', 'val')
     if args.map == 'random':
         import glob
         map_files = [os.path.basename(f) for f in glob.glob(os.path.join(map_dir, "*.map"))]
@@ -454,10 +483,10 @@ def main():
 
     default_action = np.array([
         args.v_ref,  
-        1.0,         
-        1.0,        
-        1.0,        
-        1.0,                 
+        args.w_obs,         
+        args.r_inf,        
+        args.w_lat,        
+        args.w_steer,                 
     ], dtype=np.float32)
 
     print(f"\n开始测试纯 MPC 控制: {args.episodes} episodes  map={args.map}  render={render}")
@@ -473,7 +502,7 @@ def main():
             
         map_obstacle = load_map(map_path)
         env = make_test_env(map_obstacle, use_obstacles=args.obstacles, density=args.density)
-        base_env = env.unwrapped
+        base_env = env
         
         r = run_episode(env, base_env, default_action, render, ep, save_video)
         r['map_name'] = chosen_map_file if args.map == 'random' else args.map

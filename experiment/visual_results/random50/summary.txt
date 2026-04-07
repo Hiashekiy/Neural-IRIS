@@ -1,0 +1,12 @@
+random_seed: 42
+sample_count: 50
+sample_indices: 764,813,1026,1065,1102,1125,1531,1978,2183,2406,2719,3314,4247,4434,4814,5170,5240,5305,5340,5384,5390,5982,6134,6289,6526,6638,7564,7701,7814,8124,8329,8391,8574,8791,9080,9095,9239,9329,9348,9395,9843,9910,10039,10253,10276,10628,10703,11084,11630,11656
+
+largest_empty_circle: ok=50 fail=0 skip=0
+rotated_rectangle: ok=50 fail=0 skip=0
+heuristic_ellipse_fit: ok=50 fail=0 skip=0
+segmentation_polygon_postprocess: ok=50 fail=0 skip=0
+direct_polygon_regression: ok=50 fail=0 skip=0
+iris: ok=50 fail=0 skip=0
+decomputil: ok=50 fail=0 skip=0
+firi: ok=50 fail=0 skip=0

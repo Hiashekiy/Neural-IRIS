@@ -1,0 +1,8 @@
+cd D:\ProjectDirectory\GGMPC-dev\CorridorConstraints-running
+E:\CondaEnvData\envs\GGMPC\python.exe experiment\run_parameter_metrics.py --methods ours_corridor_net,largest_empty_circle,rotated_rectangle,heuristic_ellipse_fit,segmentation_polygon_postprocess,direct_polygon_regression --raw_out experiment\metrics_results\raw_win.npz --out_txt experiment\metrics_results\summary_win.txt --out_csv experiment\metrics_results\summary_win.csv
+
+wsl -e bash -lc "cd /mnt/d/ProjectDirectory/GGMPC-dev/CorridorConstraints-running; python3 experiment/run_parameter_metrics.py --methods iris,decomputil,firi --raw_out experiment/metrics_results/raw_wsl.npz --out_txt experiment/metrics_results/summary_wsl.txt --out_csv experiment/metrics_results/summary_wsl.csv"
+
+
+cd D:\ProjectDirectory\GGMPC-dev\CorridorConstraints-running
+& E:\CondaEnvData\envs\GGMPC\python.exe experiment\merge_parameter_metrics.py --raw_a experiment\metrics_results\raw_win.npz --raw_b experiment\metrics_results\raw_wsl.npz --out_txt experiment\metrics_results\parameter_metrics_summary_merged.txt --out_csv experiment\metrics_results\parameter_metrics_summary_merged.csv

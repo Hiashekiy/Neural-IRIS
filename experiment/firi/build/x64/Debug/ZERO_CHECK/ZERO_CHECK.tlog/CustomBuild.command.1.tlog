@@ -1,0 +1,10 @@
+^D:\PROJECTDIRECTORY\GGMPC-DEV\CORRIDORCONSTRAINTS-RUNNING\EXPERIMENT\FIRI\BUILD\CMAKEFILES\BE363782230471CDE674C40E2C0608DE\GENERATE.STAMP.RULE
+setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SD:/ProjectDirectory/GGMPC-dev/CorridorConstraints-running/experiment/firi/cpp -BD:/ProjectDirectory/GGMPC-dev/CorridorConstraints-running/experiment/firi/build --check-stamp-list CMakeFiles/generate.stamp.list --vs-solution-file D:/ProjectDirectory/GGMPC-dev/CorridorConstraints-running/experiment/firi/build/firi_cli.sln
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal & call :cmErrorLevel %errorlevel% & goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd

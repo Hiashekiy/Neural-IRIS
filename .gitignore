@@ -32,3 +32,20 @@ models/
 .Trashes
 ehthumbs.db
 Thumbs.db
+
+# C++ acceleration artifacts
+cpp_accel/build/
+cpp_accel/build_cpu/
+cpp_accel/build_gpu/
+cpp_accel/onnxruntime-win-*/
+cpp_accel/*.zip
+cpp_accel/sample_mask_*.txt
+
+# Generated benchmark outputs
+experiment/metrics_results/*.npz
+experiment/metrics_results/*.csv
+experiment/metrics_results/*.txt
+!experiment/metrics_results/parameter_metrics_summary_merged.txt
+
+# third_party
+third_party/

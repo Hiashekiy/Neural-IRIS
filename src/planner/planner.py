@@ -15,10 +15,10 @@ root_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
 if root_path not in sys.path:
     sys.path.append(root_path)
 
-from src.planner.model import DynamicModel
-from src.planner.guided_motion import simulate_guided_motion
+from src.planner.car_model import DynamicModel
 from src.corridor_constraints.generate_safe_polygon import generate_safe_polygon
-from src.corridor_constraints.inference import IRISNet, parse_network_output
+from src.corridor_constraints.geometry import parse_network_output
+from src.corridor_constraints.model import CorridorEllipseNet
 from hpipm_python import (hpipm_ocp_qp_dim, hpipm_ocp_qp,
                           hpipm_ocp_qp_sol, hpipm_ocp_qp_solver_arg, hpipm_ocp_qp_solver)
 
@@ -26,15 +26,6 @@ from hpipm_python import (hpipm_ocp_qp_dim, hpipm_ocp_qp,
 # 2. MPC 规划器主体
 # =========================================================
 class Planner:
-    """
-    基于模型预测控制（MPC）的路径规划器 
-    - 向量化加速版
-    - 废弃模拟激光雷达，引入 cKDTree 局部栅格搜索 (Local Grid Bubble)
-    - 采用近邻障碍物二次排斥代价 (Nearest Obstacle Quadratic Penalty)
-    - 采用扩充控制域的稳定软约束走廊 (Stable Soft Corridor) 
-    - 采用基于预测轨迹锚定的非对称管状包络线 (Asymmetric Tube MPC)
-    """
-
     def __init__(self, sample_time: float, horizon_steps: int, veh_wheelbase=2.0):
         # ==========================================
         # 1. 基础系统与维度参数 (System & Dimensions)
@@ -75,11 +66,21 @@ class Planner:
         # 近邻障碍物斥力权重：用于放大泰勒展开计算出的障碍物二次排斥力
         self.base_weight_obs = 50.0   
         # 松弛因子惩罚权重：提供巨大的越界代价，迫使车辆严格待在走廊内 (避免权重过大导致 Bang-Bang 控制震荡)
-        self.base_weight_slack = 50.0 
+        self.base_weight_slack = 50000.0 
         # 基础速度奖励常数：在目标代价函数中提供线性的速度激励梯度
         self.base_speed_reward_c = 5.0
-        # 安全膨胀半径：用于间隙弹射(Gap Ejection)评估门槛，确保预留至少 0.6m 的物理安全距离
-        self.r_safe = 0.6
+        # 动态读取安全边界内缩距离（根据 config.json 中的车辆宽度与缓冲）
+        import json, os
+        cfg_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', 'config', 'config.json'))
+        try:
+            with open(cfg_path, 'r', encoding='utf-8') as f:
+                cfg = json.load(f)['vehicle_parameters']
+                # 让走廊至少往内收缩 车宽/2 的距离，外加一个极小的固定安全余量比如 0.1m
+                # 或者直接使用一半的车宽 + cfg 设置里面的 safety_clearance_m
+                self.r_safe = (cfg.get('car_width_m', 1.4) / 2.0) + cfg.get('safety_clearance_m', 0.1)
+        except Exception as e:
+            print(f"Failed to read config for safety radius, using default: {e}")   
+            self.r_safe = 0.8
 
         # ==========================================
         # 5. 求解稳定性与数值缩放 (Solver Numerical Scaling)
@@ -91,18 +92,18 @@ class Planner:
 
         self.pos_ub = np.array([100.0, 100.0])
         
-        # 初始化 IRISNet 用于通道生成
+        # 初始化 CorridorEllipseNet 用于通道生成
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.iris_net = IRISNet().to(self.device)
+        self.iris_net = CorridorEllipseNet().to(self.device)
         model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models/iris_net_best.pth'))
         if os.path.exists(model_path):
             try:
                 self.iris_net.load_state_dict(torch.load(model_path, map_location=self.device))
                 self.iris_net.eval()
             except Exception as e:
-                print(f"Failed to load IRISNet weights: {e}")
+                print(f"Failed to load CorridorEllipseNet weights: {e}")
         else:
-            print(f"Warning: IRISNet model path unreached: {model_path}")
+            print(f"Warning: CorridorEllipseNet model path unreached: {model_path}")
         self.patch_size = 128
         
         # 初始化 HPIPM (高性能内点法) QP 求解器
@@ -488,15 +489,10 @@ class Planner:
             results.append((A_poly, b_poly, P_inv_world, c_world, poly_time, nn_time / batch_size))
             
         return results
-
+    
     def _predict_ellipse_corridors_batched(self, occupancy_map, states_xy_list, map_resolution, max_bound=10.0):
         # 批量神经网络推理
         batch_size = len(states_xy_list)
-        import cv2
-        import torch
-        import time
-        import math
-        import numpy as np
         
         patch_np_list = []
         obs_points_list = []
@@ -509,7 +505,30 @@ class Planner:
         side_len = int(2 * r_pixel)
         
         h, w = occupancy_map.shape
-        
+
+        # === 新增优化：计算整个 Batch 的联合 ROI 包围盒 ===
+        if batch_size > 0:
+            # 预先计算所有状态点的像素坐标
+            cx_ints_temp = [int(np.round(st[0] / map_resolution)) for st in states_xy_list]
+            cy_ints_temp = [int(np.round(st[1] / map_resolution)) for st in states_xy_list]
+            
+            # 划定包含所有预测点和感受野的最小外接矩形 (包含边界保护)
+            roi_min_x = max(0, min(cx_ints_temp) - r_pixel)
+            roi_max_x = min(w, max(cx_ints_temp) + r_pixel)
+            roi_min_y = max(0, min(cy_ints_temp) - r_pixel)
+            roi_max_y = min(h, max(cy_ints_temp) + r_pixel)
+            
+            # 仅截取包含当前批次轨迹的局部小图进行形态学边缘提取
+            if roi_max_x > roi_min_x and roi_max_y > roi_min_y:
+                roi_occupancy = occupancy_map[roi_min_y:roi_max_y, roi_min_x:roi_max_x]
+                kernel = np.array([[0, 1, 0], 
+                                [1, 1, 1], 
+                                [0, 1, 0]], dtype=np.uint8)
+                roi_boundary = cv2.morphologyEx(roi_occupancy, cv2.MORPH_GRADIENT, kernel)
+            else:
+                roi_boundary = np.zeros((0, 0), dtype=np.uint8)
+        # ===================================================
+
         for state_xy in states_xy_list:
             cx_f = state_xy[0] / map_resolution
             cy_f = state_xy[1] / map_resolution
@@ -519,6 +538,7 @@ class Planner:
             c_y_ints.append(c_y_int)
             
             raw_patch = np.zeros((side_len, side_len), dtype=np.uint8)
+            bound_patch = np.zeros((side_len, side_len), dtype=np.uint8)
             
             x_min_map = c_x_int - r_pixel
             x_max_map = c_x_int + r_pixel
@@ -536,16 +556,25 @@ class Planner:
             p_y_max = side_len - (y_max_map - valid_y_max)
             
             if valid_y_max > valid_y_min and valid_x_max > valid_x_min:
+                # 原始占据地图用于神经网络推理
                 raw_patch[p_y_min:p_y_max, p_x_min:p_x_max] = occupancy_map[valid_y_min:valid_y_max, valid_x_min:valid_x_max]
+                
+                # 从联合 ROI 边界图中截取对应区域 (使用相对坐标计算)
+                roi_rel_x_min = valid_x_min - roi_min_x
+                roi_rel_x_max = valid_x_max - roi_min_x
+                roi_rel_y_min = valid_y_min - roi_min_y
+                roi_rel_y_max = valid_y_max - roi_min_y
+                bound_patch[p_y_min:p_y_max, p_x_min:p_x_max] = roi_boundary[roi_rel_y_min:roi_rel_y_max, roi_rel_x_min:roi_rel_x_max]
             
             patch_np = cv2.resize(raw_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST).astype(np.float32)
             patch_np_list.append(patch_np)
             
-            obs_y, obs_x = np.where(patch_np >= 0.5)
+            # 寻找障碍物边界坐标
+            bound_patch_resized = cv2.resize(bound_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST)
+            obs_y, obs_x = np.where(bound_patch_resized >= 0.5)
+            
             if len(obs_x) > 0:
-                # 加入轻量降采样，步长为 2 可以在不损失包络精度的前提下直接砍掉 75% 的二次型测距计算量
-                obs_y = obs_y[::2]
-                obs_x = obs_x[::2]
+                # 直接输入所有真实的边界点，抛弃危险的步长降采样
                 obs_points_list.append(np.column_stack((obs_x, obs_y)).astype(float))
             else:
                 obs_points_list.append(np.array([]))
@@ -644,62 +673,156 @@ class Planner:
             
         return results
 
-    # def get_mpc_matrix_obstacle_force(self, state_vector: np.ndarray, obstacles: np.ndarray,
-    #                                 step_index: int, H_scalar: float, R_influence=1.5) -> tuple:
-    #     """
-    #     核心升级：基于单一最近障碍点距离的一阶泰勒展开二次惩罚 (Nearest Obstacle Quadratic Penalty)
-    #     作用于预测时域内的每一点，只把点推离障碍，不强迫居中。
-    #     """
-    #     nx = self.nx
-    #     num_obstacles = obstacles.shape[0]
+    # def _predict_ellipse_corridors_batched(self, occupancy_map, states_xy_list, map_resolution, max_bound=10.0):
+    #     # 批量神经网络推理
+    #     batch_size = len(states_xy_list)
 
-    #     if num_obstacles == 0:
-    #         return np.zeros((nx, nx)), np.zeros((nx, 1)), np.zeros((0, 1))
+    #     patch_np_list = []
+    #     obs_points_list = []
+    #     c_x_ints = []
+    #     c_y_ints = []
+        
+    #     local_radius_m = 10.0
+    #     r_pixel_f = local_radius_m / map_resolution
+    #     r_pixel = int(np.round(r_pixel_f))
+    #     side_len = int(2 * r_pixel)
+        
+    #     h, w = occupancy_map.shape
+        
+    #     for state_xy in states_xy_list:
+    #         cx_f = state_xy[0] / map_resolution
+    #         cy_f = state_xy[1] / map_resolution
+    #         c_x_int = int(np.round(cx_f))
+    #         c_y_int = int(np.round(cy_f))
+    #         c_x_ints.append(c_x_int)
+    #         c_y_ints.append(c_y_int)
+            
+    #         raw_patch = np.zeros((side_len, side_len), dtype=np.uint8)
+            
+    #         x_min_map = c_x_int - r_pixel
+    #         x_max_map = c_x_int + r_pixel
+    #         y_min_map = c_y_int - r_pixel
+    #         y_max_map = c_y_int + r_pixel
+            
+    #         valid_x_min = max(0, x_min_map)
+    #         valid_x_max = min(w, x_max_map)
+    #         valid_y_min = max(0, y_min_map)
+    #         valid_y_max = min(h, y_max_map)
+            
+    #         p_x_min = valid_x_min - x_min_map
+    #         p_x_max = side_len - (x_max_map - valid_x_max)
+    #         p_y_min = valid_y_min - y_min_map
+    #         p_y_max = side_len - (y_max_map - valid_y_max)
+            
+    #         if valid_y_max > valid_y_min and valid_x_max > valid_x_min:
+    #             raw_patch[p_y_min:p_y_max, p_x_min:p_x_max] = occupancy_map[valid_y_min:valid_y_max, valid_x_min:valid_x_max]
+            
+    #         patch_np = cv2.resize(raw_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST).astype(np.float32)
+    #         patch_np_list.append(patch_np)
+            
+    #         obs_y, obs_x = np.where(patch_np >= 0.5)
+    #         if len(obs_x) > 0:
+    #             # 加入轻量降采样，步长为 2 可以在不损失包络精度的前提下直接砍掉 75% 的二次型测距计算量
+    #             obs_y = obs_y[::2]
+    #             obs_x = obs_x[::2]
+    #             obs_points_list.append(np.column_stack((obs_x, obs_y)).astype(float))
+    #         else:
+    #             obs_points_list.append(np.array([]))
+                
+    #     t_start_nn = time.time()
+        
+    #     batch_tensor = torch.from_numpy(np.array(patch_np_list)).float().unsqueeze(1).to(self.device)
+    #     with torch.no_grad():
+    #         pred_batch_tensor = self.iris_net(batch_tensor)
+            
+    #     t_end_nn = time.time()
+    #     nn_time = t_end_nn - t_start_nn
+        
+    #     mapped_resolution = (2.0 * local_radius_m) / self.patch_size
+    #     r_center = self.patch_size / 2.0
+        
+    #     results = []
+    #     for k in range(batch_size):
+    #         pred_tensor = pred_batch_tensor[k]
+    #         P_pixel, c_pixel = parse_network_output(pred_tensor, self.patch_size)
+            
+    #         physical_center_x = c_x_ints[k] * map_resolution
+    #         physical_center_y = c_y_ints[k] * map_resolution
+            
+    #         c_world = np.array([
+    #             (c_pixel[0] - r_center) * mapped_resolution + physical_center_x,
+    #             (c_pixel[1] - r_center) * mapped_resolution + physical_center_y
+    #         ])
+            
+    #         try:
+    #             P_inv_world = np.linalg.inv(P_pixel) * mapped_resolution
+    #         except np.linalg.LinAlgError:
+    #             P_inv_world = np.eye(2) * (r_pixel_f * map_resolution)
+                
+    #         t1 = time.time()
+    #         # 配合底层修改，这里直接接收不等式矩阵 A_pix 和 b_pix，不再计算顶点
+    #         A_pix, b_pix = generate_safe_polygon(P_pixel, c_pixel, obs_points_list[k], patch_size=self.patch_size)
+    #         poly_time = time.time() - t1
+            
+    #         A_poly = np.zeros((self.N_faces, 2))
+    #         b_poly = np.zeros(self.N_faces)
+            
+    #         if A_pix is not None and len(A_pix) > 0:
+    #             # --- O(1) 向量化坐标系仿射映射 ---
+    #             # 1. 转换 A_pix 到世界坐标系
+    #             A_world = A_pix / mapped_resolution
+                
+    #             # 过滤并归一化法向量
+    #             norms = np.linalg.norm(A_world, axis=1)
+    #             valid_mask = norms > 1e-5
+                
+    #             A_world = A_world[valid_mask]
+    #             b_pix = b_pix[valid_mask]
+    #             A_pix = A_pix[valid_mask]
+    #             norms = norms[valid_mask]
+                
+    #             A_world_norm = A_world / norms[:, None]
+                
+    #             # 2. 转换 b_pix 到世界坐标系
+    #             center_phys = np.array([physical_center_x, physical_center_y])
+    #             offset_pix = np.dot(A_pix, np.array([r_center, r_center]))
+    #             offset_phys = np.dot(A_world, center_phys)
+    #             b_world_raw = b_pix - offset_pix + offset_phys
+                
+    #             b_world_norm = b_world_raw / norms
+                
+    #             # 3. 引入车辆物理安全半径 (向内收缩)
+    #             b_world_safe = b_world_norm - self.r_safe
+                
+    #             # 4. 计算到局部视野中心的垂直距离进行重要性排序
+    #             dists = np.abs(np.dot(A_world_norm, c_world) - b_world_norm)
+                
+    #             valid_num = len(b_world_safe)
+    #             if valid_num > self.N_faces:
+    #                 idx = np.argsort(dists)[:self.N_faces]
+    #                 A_world_norm = A_world_norm[idx]
+    #                 b_world_safe = b_world_safe[idx]
+    #                 valid_num = self.N_faces
+                    
+    #             A_poly[:valid_num] = A_world_norm
+    #             b_poly[:valid_num] = b_world_safe
+                
+    #             # 不足 N_faces 用无效边界填满
+    #             if valid_num < self.N_faces:
+    #                 b_poly[valid_num:] = 1e5
+    #         else:
+    #             # 极速降级包络：防退化保护
+    #             A_poly[:4, :] = np.array([[1,0], [-1,0], [0,1], [0,-1]])
+    #             b_poly[0] = c_world[0] + 1.0
+    #             b_poly[1] = -(c_world[0] - 1.0)
+    #             b_poly[2] = c_world[1] + 1.0
+    #             b_poly[3] = -(c_world[1] - 1.0)
+    #             b_poly[4:] = 1e5
+                
+    #         results.append((A_poly, b_poly, P_inv_world, c_world, poly_time, nn_time / batch_size))
+            
+    #     return results
 
-    #     px = state_vector[0, 0]
-    #     py = state_vector[1, 0]
-
-    #     # 1. 寻找预测点距离最近的一个障碍物
-    #     diffs = np.array([px, py]) - obstacles
-    #     dists = np.hypot(diffs[:, 0], diffs[:, 1])
-    #     min_idx = np.argmin(dists)
-    #     min_dist = dists[min_idx]
-
-    #     Q_obs = np.zeros((nx, nx))
-    #     f_obs = np.zeros((nx, 1))
-    #     cost_vec = np.zeros((num_obstacles, 1))
-
-    #     # 2. 如果侵入影响半径，产生排斥力
-    #     if min_dist < R_influence and min_dist > 1e-5:
-    #         # 穿透误差
-    #         E = R_influence - min_dist
-            
-    #         # 远离障碍物的单位法向量 n_vec
-    #         dx = diffs[min_idx, 0]
-    #         dy = diffs[min_idx, 1]
-    #         nx_vec = dx / min_dist
-    #         ny_vec = dy / min_dist
-            
-    #         # 将二维法向量扩充为全状态维度
-    #         n_vec = np.array([nx_vec, ny_vec, 0, 0, 0])
-    #         P_bar = np.array([px, py, 0, 0, 0])
-            
-    #         # 权重随预测步衰减或终端放大
-    #         scale = self.cost_scaling if step_index == self.horizon_steps else 1.0
-    #         W_obs = H_scalar * scale
-            
-    #         # 3. 构建局部二次规划矩阵 Q 和 f
-    #         # 代价函数 J = 0.5 * W * (E - n^T * (P - P_bar))^2 展开后：
-    #         # Q = W * n * n^T
-    #         Q_obs = W_obs * np.outer(n_vec, n_vec)
-            
-    #         # f = -W * (n^T * P_bar + E) * n
-    #         f_obs = -W_obs * (np.dot(n_vec, P_bar) + E) * n_vec.reshape(-1, 1)
-            
-    #         # 记录当前步的代价以供可视化
-    #         cost_vec[min_idx, 0] = 0.5 * W_obs * (E ** 2)
-
-    #     return Q_obs, f_obs, cost_vec
 
     def get_mpc_matrix_obstacle_force(self, state_vector: np.ndarray, obstacles: np.ndarray,
                                     step_index: int, H_scalar: float, R_influence=1.5) -> tuple:
@@ -812,7 +935,7 @@ class Planner:
     #     kdtree, local_obs = self._build_local_kdtree(occupancy_map, current_ego_state, map_resolution, radius=30.0)
     #     # =========================================================================
         
-    #     # >>> 单次利用 IRISNet 批量生成预测几何多边形边界 <<<
+    #     # >>> 单次利用 CorridorEllipseNet 批量生成预测几何多边形边界 <<<
     #     states_xy_list = [(predicted_states[0, i], predicted_states[1, i]) for i in range(self.horizon_steps + 1)]
     #     batched_results = self._predict_ellipse_corridors_batched(occupancy_map, states_xy_list, map_resolution)
 
@@ -979,7 +1102,7 @@ class Planner:
         kdtree, local_obs = self._build_local_kdtree(occupancy_map, current_ego_state, map_resolution, radius=30.0)
         # =========================================================================
         
-        # >>> 单次利用 IRISNet 批量生成预测几何多边形边界 <<<
+        # >>> 单次利用 CorridorEllipseNet 批量生成预测几何多边形边界 <<<
         states_xy_list = [(predicted_states[0, i], predicted_states[1, i]) for i in range(self.horizon_steps + 1)]
         batched_results = self._predict_ellipse_corridors_batched(occupancy_map, states_xy_list, map_resolution)
 
@@ -1096,10 +1219,8 @@ class Planner:
 
         return mpc_stage_dict, sum_poly_time, sum_nn_time
     
-    def step_once(self, current_state: np.ndarray, last_ctrl: np.ndarray, guesses: tuple, 
-                  map_obstacle: np.ndarray, path_points: list, 
-                  guide_cumulative_dists: np.ndarray,
-                  current_s: float,
+    def step_once(self, current_state: np.ndarray, last_ctrl: np.ndarray, guesses: tuple,
+                  map_obstacle: np.ndarray, guided_points: dict,
                   target_velocity: float, 
                   weight_lat_scale: float = 1.0, 
                   weight_lon_scale: float = 1.0,
@@ -1123,17 +1244,9 @@ class Planner:
             temp[:min_dim, :] = X_guess[:min_dim, :]
             X_guess = temp
         
-        s0 = current_state 
-        
-        pos_guided, phi_guided = simulate_guided_motion(
-            current_s=current_s,
-            path_points=path_points,
-            cumulative_dists=guide_cumulative_dists,
-            velocity=target_velocity, 
-            sample_time=self.sample_time, 
-            num_steps=self.horizon_steps
-        )
-        guided_points = {"posi": pos_guided, "angle": phi_guided}
+        s0 = current_state
+        pos_guided = guided_points['posi']
+        phi_guided = guided_points['angle']
         
         import time
         # 核心：使用上一帧滚动传来的 Guess 轨迹作为包络线提取锚点，使其随时间前进而非原地切片
@@ -1198,7 +1311,7 @@ class Planner:
         next_state = self.model.sim_forward_step(current_state, next_ctrl_safe)
         X_next_guess, U_next_guess = self.horizon_forward_step(X_opt, U_opt, next_state)
         
-        return next_state, next_ctrl_safe, X_next_guess, U_next_guess, pos_guided, phi_guided, info
+        return next_state, next_ctrl_safe, X_next_guess, U_next_guess, info
 
     def solve_with_hpipm(self, initial_state, mpc_stage_dict, x_guess=None, u_guess=None):
         self.qp_problem.set('lbx', initial_state, 0)
