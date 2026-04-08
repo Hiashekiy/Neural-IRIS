@@ -62,6 +62,13 @@ cmake --build build_gpu --config Release
 - `onnxruntime_providers_cuda.dll`
 - `onnxruntime_providers_shared.dll`
 
+
+## 编译（CPU）
+$env:ONNXRUNTIME_ROOT = "D:/ProjectDirectory/GGMPC-dev/CorridorConstraints-running/cpp/onnxruntime-win-x64-1.19.2"
+Remove-Item -Recurse -Force build_cpu
+cmake -S . -B build_cpu -G "Visual Studio 17 2022" -DONNXRUNTIME_ROOT=$env:ONNXRUNTIME_ROOT -DUSE_CUDA_PROVIDER=OFF
+cmake --build build_cpu --config Release
+
 ## 4) 独立运行（可选）
 
 输入掩码格式：128 行，每行 128 个字符（`0` 或 `1`）。
