@@ -1,0 +1,2 @@
+method,samples,valid_count,valid_rate,center_in_rate,collision_rate,collision_area_ratio,normalized_area,mean_latency_ms,native_area_mean
+ours_corridor_net,11986,11986,1.0,0.9983313866177207,0.0,0.0,nan,3.206066060414424,4622.163323207838

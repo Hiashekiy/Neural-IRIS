@@ -240,6 +240,101 @@ __declspec(dllexport) int corridor_infer_batch(
   }
 }
 
+__declspec(dllexport) int corridor_infer_batch_with_ellipse(
+    const uint8_t* masks_ptr,
+    int batch_size,
+    int patch_size,
+    double safety_margin,
+    double* out_vertices_xy,
+    int max_vertices,
+    int* out_vertex_counts,
+    double* out_p_mats,
+    double* out_centers) {
+  try {
+    if (!g_sess || !masks_ptr || !out_vertices_xy || !out_vertex_counts || !out_p_mats || !out_centers ||
+        batch_size <= 0 || patch_size <= 0 || max_vertices <= 0) {
+      return 2;
+    }
+
+    std::lock_guard<std::mutex> lk(g_mu);
+
+    const size_t one_n = static_cast<size_t>(patch_size * patch_size);
+    const size_t all_n = static_cast<size_t>(batch_size) * one_n;
+
+    std::vector<float> input(all_n, 0.0f);
+    for (size_t i = 0; i < all_n; ++i) {
+      input[i] = masks_ptr[i] ? 1.0f : 0.0f;
+    }
+
+    std::array<int64_t, 4> input_shape = {batch_size, 1, patch_size, patch_size};
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        mem_info,
+        input.data(),
+        input.size(),
+        input_shape.data(),
+        input_shape.size());
+
+    const char* in_name = g_input_name.c_str();
+    const char* out_name = g_output_name.c_str();
+    auto output_tensors = g_sess->Run(Ort::RunOptions{nullptr}, &in_name, &input_tensor, 1, &out_name, 1);
+
+    float* pred = output_tensors[0].GetTensorMutableData<float>();
+
+    for (int bi = 0; bi < batch_size; ++bi) {
+      out_vertex_counts[bi] = 0;
+      const float* pred_i = pred + static_cast<size_t>(bi) * 6;
+
+      Mat2 P{};
+      Point2 c{};
+      parse_pred_to_geometry(pred_i, patch_size, P, c);
+
+      const size_t p_off = static_cast<size_t>(bi) * 4;
+      out_p_mats[p_off + 0] = P[0][0];
+      out_p_mats[p_off + 1] = P[0][1];
+      out_p_mats[p_off + 2] = P[1][0];
+      out_p_mats[p_off + 3] = P[1][1];
+
+      const size_t c_off = static_cast<size_t>(bi) * 2;
+      out_centers[c_off + 0] = c.x;
+      out_centers[c_off + 1] = c.y;
+
+      const uint8_t* mask_i_ptr = masks_ptr + static_cast<size_t>(bi) * one_n;
+      std::vector<uint8_t> obs_mask(one_n, 0);
+      for (size_t k = 0; k < one_n; ++k) {
+        obs_mask[k] = mask_i_ptr[k] ? 1 : 0;
+      }
+
+      std::vector<Point2> obs_points = extract_obstacle_boundary(obs_mask, patch_size, patch_size);
+      std::vector<Vec2> A;
+      std::vector<double> b;
+      build_safe_halfspaces(P, c, obs_points, patch_size, safety_margin, A, b);
+
+      Point2 center{patch_size / 2.0, patch_size / 2.0};
+      std::vector<Point2> poly = halfspace_intersection_2d(A, b, center);
+      if (poly.size() < 3) {
+        poly = halfspace_intersection_2d(A, b, c);
+      }
+
+      const int write_n = static_cast<int>(std::min<size_t>(poly.size(), static_cast<size_t>(max_vertices)));
+      out_vertex_counts[bi] = write_n;
+
+      const size_t out_off = static_cast<size_t>(bi) * static_cast<size_t>(max_vertices) * 2;
+      for (int vi = 0; vi < write_n; ++vi) {
+        out_vertices_xy[out_off + static_cast<size_t>(2 * vi + 0)] = poly[static_cast<size_t>(vi)].x;
+        out_vertices_xy[out_off + static_cast<size_t>(2 * vi + 1)] = poly[static_cast<size_t>(vi)].y;
+      }
+    }
+
+    return 0;
+  } catch (...) {
+    for (int bi = 0; bi < batch_size; ++bi) {
+      out_vertex_counts[bi] = 0;
+    }
+    return 3;
+  }
+}
+
 __declspec(dllexport) void corridor_shutdown() {
   std::lock_guard<std::mutex> lk(g_mu);
   g_sess.reset();

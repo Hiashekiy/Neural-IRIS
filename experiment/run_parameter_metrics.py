@@ -85,6 +85,28 @@ def polygon_mask(vertices: np.ndarray, patch_size: int = 128):
     return inside.reshape((patch_size, patch_size))
 
 
+def erode_binary_mask(mask: np.ndarray, radius_px: int = 1) -> np.ndarray:
+    mask = np.asarray(mask, dtype=bool)
+    if radius_px <= 0:
+        return mask
+
+    padded = np.pad(mask, radius_px, mode="constant", constant_values=False)
+    out = np.ones_like(mask, dtype=bool)
+    size = 2 * radius_px + 1
+    for dy in range(size):
+        for dx in range(size):
+            out &= padded[dy:dy + mask.shape[0], dx:dx + mask.shape[1]]
+    return out
+
+
+def collision_overlap_pixels(poly_mask: np.ndarray, obs_mask: np.ndarray, obstacle_margin_px: int = 1) -> float:
+    if poly_mask is None:
+        return 0.0
+    if obstacle_margin_px > 0:
+        obs_mask = erode_binary_mask(obs_mask, radius_px=obstacle_margin_px)
+    return float(np.sum(np.asarray(poly_mask, dtype=bool) & np.asarray(obs_mask, dtype=bool)))
+
+
 def _resolve_methods(method_names: List[str] | None):
     if not method_names:
         return METHODS
@@ -97,11 +119,14 @@ def _resolve_methods(method_names: List[str] | None):
     return resolved
 
 
-def evaluate(max_samples=None, patch_size: int = 128, method_names: List[str] | None = None, strict_collision: bool = False, use_batch: bool = True, batch_size_override: int | None = None):
+def evaluate(max_samples=None, patch_size: int = 128, method_names: List[str] | None = None, strict_collision: bool = False, use_batch: bool = True, batch_size_override: int | None = None, collision_margin_px: int = 1):
     """
     Args:
-        strict_collision: if False (default), collision area must be >= 1% of polygon area to count; 
-                         if True, any pixel overlap counts
+        strict_collision: if False (default), collision area must be >= 1% of polygon area to count;
+                         if True, any pixel overlap counts.
+        collision_margin_px: obstacle mask erosion radius used before overlap counting.
+                             This suppresses false positives caused by polygons that only touch
+                             the obstacle boundary in raster space.
     """
     selected_methods = _resolve_methods(method_names)
     print(f"[metrics] loading test data: {TEST_DATA_PATH}")
@@ -109,7 +134,10 @@ def evaluate(max_samples=None, patch_size: int = 128, method_names: List[str] | 
     n = len(patches) if max_samples is None else min(int(max_samples), len(patches))
     patches = patches[:n]
     print(f"[metrics] evaluating samples: {n}")
-    collision_threshold = "strict (any pixel)" if strict_collision else "relaxed (≥1% area)"
+    if strict_collision:
+        collision_threshold = f"strict (any overlap, obstacle erode={collision_margin_px}px)"
+    else:
+        collision_threshold = f"relaxed (≥1% area, obstacle erode={collision_margin_px}px)"
     print(f"[metrics] collision threshold: {collision_threshold}")
 
     center = np.array([patch_size / 2.0, patch_size / 2.0], dtype=float)
@@ -169,7 +197,7 @@ def evaluate(max_samples=None, patch_size: int = 128, method_names: List[str] | 
         results[name]["poly_area_mask"][i] = float(mask.sum())
         results[name]["poly_area_native"][i] = float(polygon_area(v))
 
-        coll_area_pixels = float(np.sum(mask & obs_mask))
+        coll_area_pixels = collision_overlap_pixels(mask, obs_mask, obstacle_margin_px=collision_margin_px)
         results[name]["coll_area"][i] = coll_area_pixels
 
         if strict_collision:
@@ -348,8 +376,8 @@ def _save_raw(results: Dict[str, Dict[str, np.ndarray]], selected_methods: List[
     np.savez_compressed(path, **payload)
 
 
-def main(max_samples=None, method_names: List[str] | None = None, out_txt: str = OUT_TXT, out_csv: str = OUT_CSV, raw_out: str | None = OUT_RAW, strict_collision: bool = False, use_batch: bool = True, batch_size_override: int | None = None):
-    rows, skipped, results, selected_methods, n = evaluate(max_samples=max_samples, method_names=method_names, strict_collision=strict_collision, use_batch=use_batch, batch_size_override=batch_size_override)
+def main(max_samples=None, method_names: List[str] | None = None, out_txt: str = OUT_TXT, out_csv: str = OUT_CSV, raw_out: str | None = OUT_RAW, strict_collision: bool = False, use_batch: bool = True, batch_size_override: int | None = None, collision_margin_px: int = 1):
+    rows, skipped, results, selected_methods, n = evaluate(max_samples=max_samples, method_names=method_names, strict_collision=strict_collision, use_batch=use_batch, batch_size_override=batch_size_override, collision_margin_px=collision_margin_px)
 
     txt = []
     txt.append("[Parameter Metrics Summary]")
@@ -388,6 +416,7 @@ if __name__ == "__main__":
         parser.add_argument("--strict", action="store_true", help="use strict collision (any pixel); default is relaxed (≥1%% area)")
         parser.add_argument("--no_batch", action="store_true", help="disable batch inference path even if method provides infer_polygon_batch")
         parser.add_argument("--batch_size", type=int, default=None, help="override batch size for methods with infer_polygon_batch")
+        parser.add_argument("--collision_margin_px", type=int, default=1, help="erode obstacle mask by this many pixels before collision counting")
         args = parser.parse_args()
         method_names = None
         if args.methods:
@@ -401,6 +430,7 @@ if __name__ == "__main__":
             strict_collision=args.strict,
             use_batch=(not args.no_batch),
             batch_size_override=args.batch_size,
+            collision_margin_px=max(0, int(args.collision_margin_px)),
         )
     except Exception:
         traceback.print_exc()

@@ -1,0 +1,6 @@
+[Parameter Metrics Summary]
+samples=11986
+
+method                                valid  center_in  coll_rate  coll_area  norm_area     lat_ms
+--------------------------------------------------------------------------------------------------
+ours_corridor_net                   100.00%     99.83%      0.00%     0.000%     nan        3.206

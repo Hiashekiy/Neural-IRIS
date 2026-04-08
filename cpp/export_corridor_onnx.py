@@ -12,7 +12,7 @@ from src.corridor_constraints.model import CorridorEllipseNet
 
 def main():
     model_path = os.path.join(ROOT, "models", "iris_net_best.pth")
-    out_dir = os.path.join(ROOT, "cpp_accel", "models")
+    out_dir = os.path.join(ROOT, "cpp", "models")
     os.makedirs(out_dir, exist_ok=True)
     onnx_path = os.path.join(out_dir, "corridor_ellipse_net.onnx")
 

@@ -58,10 +58,10 @@ def analyze_collisions(n_analyze=50):
                     v = halfspace_intersection_vertices(np.asarray(A, dtype=float), np.asarray(b, dtype=float), center)
                     if v is not None and len(v) >= 3:
                         # Check collision: rasterize polygon and check overlap with obstacles
-                        from experiment.run_parameter_metrics import polygon_mask
+                        from experiment.run_parameter_metrics import collision_overlap_pixels, polygon_mask
                         mask = polygon_mask(v, patch_size=patch_size)
                         if mask is not None:
-                            coll_pixels = np.sum(mask & obs_mask)
+                            coll_pixels = collision_overlap_pixels(mask, obs_mask, obstacle_margin_px=1)
                             coll_percent = coll_pixels / mask.sum()
                             
                             # Relaxed collision: >= 1% area

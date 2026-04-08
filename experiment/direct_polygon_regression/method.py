@@ -2,7 +2,6 @@ import numpy as np
 import os
 
 from experiment.common.geometry_utils import (
-    raycast_distance,
     fallback_patch_box,
     convex_polygon_from_radial_bounds,
 )
@@ -61,12 +60,42 @@ def _smooth_circular(arr: np.ndarray, k: int = 2):
     return out
 
 
+def _raycast_distances_vectorized(obs_mask: np.ndarray, center: np.ndarray, angles: np.ndarray, max_dist: float = 90.0, step: float = 0.5) -> np.ndarray:
+    """Vectorized radial raycast on a binary obstacle map for all directions."""
+    h, w = obs_mask.shape
+    dists = np.arange(0.0, max_dist + step, step, dtype=float)
+
+    cos_t = np.cos(angles)[:, None]
+    sin_t = np.sin(angles)[:, None]
+
+    xs = center[0] + cos_t * dists[None, :]
+    ys = center[1] + sin_t * dists[None, :]
+
+    ix = np.rint(xs).astype(np.int32)
+    iy = np.rint(ys).astype(np.int32)
+
+    in_bounds = (ix >= 0) & (ix < w) & (iy >= 0) & (iy < h)
+    ix_clip = np.clip(ix, 0, w - 1)
+    iy_clip = np.clip(iy, 0, h - 1)
+
+    free = in_bounds & (~obs_mask[iy_clip, ix_clip])
+    hit = ~free
+
+    any_hit = np.any(hit, axis=1)
+    first_hit = np.argmax(hit, axis=1)
+    safe_idx = np.maximum(first_hit - 1, 0)
+    safe_dist = dists[safe_idx]
+
+    return np.where(any_hit, safe_dist, max_dist)
+
+
 def infer_polygon(obs_mask, center=(64.0, 64.0), patch_size=128):
     center = np.asarray(center, dtype=float)
+    obs_mask = np.asarray(obs_mask, dtype=bool)
 
     k_dirs = 32
     angles = np.linspace(0.0, 2.0 * np.pi, k_dirs, endpoint=False)
-    radii_raw = np.array([raycast_distance(obs_mask, center, ang, max_dist=90.0) for ang in angles], dtype=float)
+    radii_raw = _raycast_distances_vectorized(obs_mask, center, angles, max_dist=90.0, step=0.5)
     radii_raw = np.maximum(radii_raw - 0.8, 1.0)
 
     model = _load_model_if_available(k_dirs=k_dirs)

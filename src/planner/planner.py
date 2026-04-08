@@ -19,6 +19,12 @@ from src.planner.car_model import DynamicModel
 from src.corridor_constraints.generate_safe_polygon import generate_safe_polygon
 from src.corridor_constraints.geometry import parse_network_output
 from src.corridor_constraints.model import CorridorEllipseNet
+try:
+    from experiment.ours_corridor_cpp.method import infer_polygon_batch as cpp_infer_polygon_batch
+    from experiment.ours_corridor_cpp.method import infer_polygon_batch_with_ellipse as cpp_infer_polygon_batch_with_ellipse
+except Exception:
+    cpp_infer_polygon_batch = None
+    cpp_infer_polygon_batch_with_ellipse = None
 from hpipm_python import (hpipm_ocp_qp_dim, hpipm_ocp_qp,
                           hpipm_ocp_qp_sol, hpipm_ocp_qp_solver_arg, hpipm_ocp_qp_solver)
 
@@ -92,18 +98,21 @@ class Planner:
 
         self.pos_ub = np.array([100.0, 100.0])
         
-        # 初始化 CorridorEllipseNet 用于通道生成
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.iris_net = CorridorEllipseNet().to(self.device)
-        model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models/iris_net_best.pth'))
-        if os.path.exists(model_path):
-            try:
-                self.iris_net.load_state_dict(torch.load(model_path, map_location=self.device))
-                self.iris_net.eval()
-            except Exception as e:
-                print(f"Failed to load CorridorEllipseNet weights: {e}")
-        else:
-            print(f"Warning: CorridorEllipseNet model path unreached: {model_path}")
+        # 优先使用 C++ GPU 批量通道生成。
+        os.environ.setdefault("OURS_CPP_BACKEND", "gpu")
+        self.use_cpp_corridor = cpp_infer_polygon_batch is not None
+        if not self.use_cpp_corridor:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            self.iris_net = CorridorEllipseNet().to(self.device)
+            model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models/iris_net_best.pth'))
+            if os.path.exists(model_path):
+                try:
+                    self.iris_net.load_state_dict(torch.load(model_path, map_location=self.device))
+                    self.iris_net.eval()
+                except Exception as e:
+                    print(f"Failed to load CorridorEllipseNet weights: {e}")
+            else:
+                print(f"Warning: CorridorEllipseNet model path unreached: {model_path}")
         self.patch_size = 128
         
         # 初始化 HPIPM (高性能内点法) QP 求解器
@@ -259,6 +268,126 @@ class Planner:
             else:
                 obs_points_list.append(np.array([]))
                 
+        if self.use_cpp_corridor and cpp_infer_polygon_batch is not None:
+            def _polygon_to_halfspaces(poly_world: np.ndarray, center_world: np.ndarray):
+                A_poly = np.zeros((self.N_faces, 2))
+                b_poly = np.zeros(self.N_faces)
+
+                if poly_world is None or len(poly_world) < 3:
+                    A_poly[:4, :] = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
+                    b_poly[0] = center_world[0] + 1.0
+                    b_poly[1] = -(center_world[0] - 1.0)
+                    b_poly[2] = center_world[1] + 1.0
+                    b_poly[3] = -(center_world[1] - 1.0)
+                    b_poly[4:] = 1e5
+                    return A_poly, b_poly, center_world.copy()
+
+                poly_world = np.asarray(poly_world, dtype=float)
+                signed_area = 0.5 * float(np.sum(poly_world[:, 0] * np.roll(poly_world[:, 1], -1) - poly_world[:, 1] * np.roll(poly_world[:, 0], -1)))
+                if signed_area < 0.0:
+                    poly_world = poly_world[::-1]
+
+                valid_num = 0
+                centroid = poly_world.mean(axis=0)
+                for i in range(len(poly_world)):
+                    p1 = poly_world[i]
+                    p2 = poly_world[(i + 1) % len(poly_world)]
+                    dx = p2[0] - p1[0]
+                    dy = p2[1] - p1[1]
+                    length = math.hypot(dx, dy)
+                    if length < 1e-8:
+                        continue
+                    nx = dy / length
+                    ny = -dx / length
+                    A_poly[valid_num] = [nx, ny]
+                    b_poly[valid_num] = nx * p1[0] + ny * p1[1] - self.r_safe
+                    valid_num += 1
+                    if valid_num >= self.N_faces:
+                        break
+
+                if valid_num < self.N_faces:
+                    b_poly[valid_num:] = 1e5
+
+                return A_poly, b_poly, centroid
+
+            def _safe_visual_shape(A_poly: np.ndarray, b_poly: np.ndarray, c_world: np.ndarray):
+                # 为可视化构造一个保证在 A x <= b 内部的保守内接圆。
+                # 绘制端使用 c + P_inv @ unit_circle，因此这里返回 r I。
+                valid = (np.linalg.norm(A_poly, axis=1) > 1e-8) & (b_poly < 1e4)
+                if not np.any(valid):
+                    return np.eye(2)
+                A_v = A_poly[valid]
+                b_v = b_poly[valid]
+                margins = b_v - (A_v @ c_world)
+                if margins.size == 0:
+                    return np.eye(2)
+                r = float(np.min(margins))
+                if not np.isfinite(r) or r <= 1e-3:
+                    r = 1e-3
+                return r * np.eye(2)
+
+            t_start_nn = time.time()
+            try:
+                if cpp_infer_polygon_batch_with_ellipse is not None:
+                    poly_batch, p_batch, c_batch = cpp_infer_polygon_batch_with_ellipse(
+                        np.asarray(patch_np_list, dtype=np.float32), patch_size=self.patch_size
+                    )
+                else:
+                    poly_batch = cpp_infer_polygon_batch(np.asarray(patch_np_list, dtype=np.float32), patch_size=self.patch_size)
+                    p_batch = [None for _ in range(batch_size)]
+                    c_batch = [None for _ in range(batch_size)]
+            except Exception as e:
+                print(f"[Planner] C++ corridor batch failed, fallback to empty corridors: {e}")
+                poly_batch = [None for _ in range(batch_size)]
+                p_batch = [None for _ in range(batch_size)]
+                c_batch = [None for _ in range(batch_size)]
+            t_end_nn = time.time()
+            nn_time = t_end_nn - t_start_nn
+
+            results = []
+            for k in range(batch_size):
+                physical_center_x = c_x_ints[k] * map_resolution
+                physical_center_y = c_y_ints[k] * map_resolution
+                center_world = np.array([physical_center_x, physical_center_y], dtype=float)
+
+                t1 = time.time()
+                poly_points = poly_batch[k] if k < len(poly_batch) else None
+                if poly_points is not None:
+                    poly_points = np.asarray(poly_points, dtype=float)
+                if poly_points is not None and len(poly_points) >= 3:
+                    poly_world = (poly_points - r_center) * mapped_resolution + center_world[None, :]
+                    A_poly, b_poly, c_world_poly = _polygon_to_halfspaces(poly_world, center_world)
+                    p_pixel = p_batch[k] if k < len(p_batch) else None
+                    c_pixel = c_batch[k] if k < len(c_batch) else None
+                    if p_pixel is not None and c_pixel is not None:
+                        c_world = np.array([
+                            (float(c_pixel[0]) - r_center) * mapped_resolution + physical_center_x,
+                            (float(c_pixel[1]) - r_center) * mapped_resolution + physical_center_y,
+                        ])
+                        try:
+                            P_inv_world = np.linalg.inv(np.asarray(p_pixel, dtype=float)) * mapped_resolution
+                        except np.linalg.LinAlgError:
+                            P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
+                    else:
+                        c_world = c_world_poly
+                        P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
+                else:
+                    A_poly = np.zeros((self.N_faces, 2))
+                    b_poly = np.zeros(self.N_faces)
+                    A_poly[:4, :] = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
+                    b_poly[0] = center_world[0] + 1.0
+                    b_poly[1] = -(center_world[0] - 1.0)
+                    b_poly[2] = center_world[1] + 1.0
+                    b_poly[3] = -(center_world[1] - 1.0)
+                    b_poly[4:] = 1e5
+                    c_world = center_world
+                    P_inv_world = np.eye(2)
+
+                poly_time = time.time() - t1
+                results.append((A_poly, b_poly, P_inv_world, c_world, poly_time, nn_time / max(1, batch_size)))
+
+            return results
+
         t_start_nn = time.time()
         
         # 直接使用 non_blocking=True 加速 H2D 拷贝，并激活 AMP
@@ -578,6 +707,130 @@ class Planner:
                 obs_points_list.append(np.column_stack((obs_x, obs_y)).astype(float))
             else:
                 obs_points_list.append(np.array([]))
+
+        mapped_resolution = (2.0 * local_radius_m) / self.patch_size
+        r_center = self.patch_size / 2.0
+
+        if self.use_cpp_corridor and cpp_infer_polygon_batch is not None:
+            def _polygon_to_halfspaces(poly_world: np.ndarray, center_world: np.ndarray):
+                A_poly = np.zeros((self.N_faces, 2))
+                b_poly = np.zeros(self.N_faces)
+
+                if poly_world is None or len(poly_world) < 3:
+                    A_poly[:4, :] = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
+                    b_poly[0] = center_world[0] + 1.0
+                    b_poly[1] = -(center_world[0] - 1.0)
+                    b_poly[2] = center_world[1] + 1.0
+                    b_poly[3] = -(center_world[1] - 1.0)
+                    b_poly[4:] = 1e5
+                    return A_poly, b_poly, center_world.copy()
+
+                poly_world = np.asarray(poly_world, dtype=float)
+                signed_area = 0.5 * float(np.sum(poly_world[:, 0] * np.roll(poly_world[:, 1], -1) - poly_world[:, 1] * np.roll(poly_world[:, 0], -1)))
+                if signed_area < 0.0:
+                    poly_world = poly_world[::-1]
+
+                valid_num = 0
+                centroid = poly_world.mean(axis=0)
+                for i in range(len(poly_world)):
+                    p1 = poly_world[i]
+                    p2 = poly_world[(i + 1) % len(poly_world)]
+                    dx = p2[0] - p1[0]
+                    dy = p2[1] - p1[1]
+                    length = math.hypot(dx, dy)
+                    if length < 1e-8:
+                        continue
+                    nx = dy / length
+                    ny = -dx / length
+                    A_poly[valid_num] = [nx, ny]
+                    b_poly[valid_num] = nx * p1[0] + ny * p1[1] - self.r_safe
+                    valid_num += 1
+                    if valid_num >= self.N_faces:
+                        break
+
+                if valid_num < self.N_faces:
+                    b_poly[valid_num:] = 1e5
+
+                return A_poly, b_poly, centroid
+
+            def _safe_visual_shape(A_poly: np.ndarray, b_poly: np.ndarray, c_world: np.ndarray):
+                # 为可视化构造一个保证在 A x <= b 内部的保守内接圆。
+                # 绘制端使用 c + P_inv @ unit_circle，因此这里返回 r I。
+                valid = (np.linalg.norm(A_poly, axis=1) > 1e-8) & (b_poly < 1e4)
+                if not np.any(valid):
+                    return np.eye(2)
+                A_v = A_poly[valid]
+                b_v = b_poly[valid]
+                margins = b_v - (A_v @ c_world)
+                if margins.size == 0:
+                    return np.eye(2)
+                r = float(np.min(margins))
+                if not np.isfinite(r) or r <= 1e-3:
+                    r = 1e-3
+                return r * np.eye(2)
+
+            t_start_nn = time.time()
+            try:
+                if cpp_infer_polygon_batch_with_ellipse is not None:
+                    poly_batch, p_batch, c_batch = cpp_infer_polygon_batch_with_ellipse(
+                        np.asarray(patch_np_list, dtype=np.float32), patch_size=self.patch_size
+                    )
+                else:
+                    poly_batch = cpp_infer_polygon_batch(np.asarray(patch_np_list, dtype=np.float32), patch_size=self.patch_size)
+                    p_batch = [None for _ in range(batch_size)]
+                    c_batch = [None for _ in range(batch_size)]
+            except Exception as e:
+                print(f"[Planner] C++ corridor batch failed, fallback to empty corridors: {e}")
+                poly_batch = [None for _ in range(batch_size)]
+                p_batch = [None for _ in range(batch_size)]
+                c_batch = [None for _ in range(batch_size)]
+            batch_call_time = time.time() - t_start_nn
+
+            results = []
+            for k in range(batch_size):
+                physical_center_x = c_x_ints[k] * map_resolution
+                physical_center_y = c_y_ints[k] * map_resolution
+                center_world = np.array([physical_center_x, physical_center_y], dtype=float)
+
+                t1 = time.time()
+                poly_points = poly_batch[k] if k < len(poly_batch) else None
+                if poly_points is not None:
+                    poly_points = np.asarray(poly_points, dtype=float)
+                if poly_points is not None and len(poly_points) >= 3:
+                    poly_world = (poly_points - r_center) * mapped_resolution + center_world[None, :]
+                    A_poly, b_poly, c_world_poly = _polygon_to_halfspaces(poly_world, center_world)
+                    p_pixel = p_batch[k] if k < len(p_batch) else None
+                    c_pixel = c_batch[k] if k < len(c_batch) else None
+                    if p_pixel is not None and c_pixel is not None:
+                        c_world = np.array([
+                            (float(c_pixel[0]) - r_center) * mapped_resolution + physical_center_x,
+                            (float(c_pixel[1]) - r_center) * mapped_resolution + physical_center_y,
+                        ])
+                        try:
+                            P_inv_world = np.linalg.inv(np.asarray(p_pixel, dtype=float)) * mapped_resolution
+                        except np.linalg.LinAlgError:
+                            P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
+                    else:
+                        c_world = c_world_poly
+                        P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
+                else:
+                    A_poly = np.zeros((self.N_faces, 2))
+                    b_poly = np.zeros(self.N_faces)
+                    A_poly[:4, :] = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
+                    b_poly[0] = center_world[0] + 1.0
+                    b_poly[1] = -(center_world[0] - 1.0)
+                    b_poly[2] = center_world[1] + 1.0
+                    b_poly[3] = -(center_world[1] - 1.0)
+                    b_poly[4:] = 1e5
+                    c_world = center_world
+                    P_inv_world = np.eye(2)
+
+                python_postprocess_time = time.time() - t1
+                per_item_batch_call_time = batch_call_time / max(1, batch_size)
+                total_corridor_time = per_item_batch_call_time + python_postprocess_time
+                results.append((A_poly, b_poly, P_inv_world, c_world, per_item_batch_call_time, python_postprocess_time, total_corridor_time))
+
+            return results
                 
         t_start_nn = time.time()
         
@@ -586,7 +839,7 @@ class Planner:
             pred_batch_tensor = self.iris_net(batch_tensor)
             
         t_end_nn = time.time()
-        nn_time = t_end_nn - t_start_nn
+        batch_call_time = t_end_nn - t_start_nn
         
         mapped_resolution = (2.0 * local_radius_m) / self.patch_size
         r_center = self.patch_size / 2.0
@@ -612,7 +865,7 @@ class Planner:
             t1 = time.time()
             # 配合底层修改，这里直接接收不等式矩阵 A_pix 和 b_pix，不再计算顶点
             A_pix, b_pix = generate_safe_polygon(P_pixel, c_pixel, obs_points_list[k], patch_size=self.patch_size)
-            poly_time = time.time() - t1
+            python_postprocess_time = time.time() - t1
             
             A_poly = np.zeros((self.N_faces, 2))
             b_poly = np.zeros(self.N_faces)
@@ -669,7 +922,9 @@ class Planner:
                 b_poly[3] = -(c_world[1] - 1.0)
                 b_poly[4:] = 1e5
                 
-            results.append((A_poly, b_poly, P_inv_world, c_world, poly_time, nn_time / batch_size))
+            per_item_batch_call_time = batch_call_time / max(1, batch_size)
+            total_corridor_time = per_item_batch_call_time + python_postprocess_time
+            results.append((A_poly, b_poly, P_inv_world, c_world, per_item_batch_call_time, python_postprocess_time, total_corridor_time))
             
         return results
 
@@ -1066,8 +1321,9 @@ class Planner:
         mpc_stage_dict = {}
         pos_refs = np.array(guided_points['posi'])
         angle_refs = np.array(guided_points['angle'])
-        sum_nn_time = 0.0
-        sum_poly_time = 0.0
+        sum_batch_call_time = 0.0
+        sum_python_postprocess_time = 0.0
+        sum_total_corridor_time = 0.0
         
         Q_lat = self.base_Q_lat * weight_lat_scale
         Q_lon = self.base_Q_lon * weight_lon_scale
@@ -1102,7 +1358,7 @@ class Planner:
         kdtree, local_obs = self._build_local_kdtree(occupancy_map, current_ego_state, map_resolution, radius=30.0)
         # =========================================================================
         
-        # >>> 单次利用 CorridorEllipseNet 批量生成预测几何多边形边界 <<<
+        # >>> 单次利用 C++ GPU 批量生成预测几何多边形边界 <<<
         states_xy_list = [(predicted_states[0, i], predicted_states[1, i]) for i in range(self.horizon_steps + 1)]
         batched_results = self._predict_ellipse_corridors_batched(occupancy_map, states_xy_list, map_resolution)
 
@@ -1172,9 +1428,10 @@ class Planner:
             Qk += Qk_obs
             fk += fk_obs.flatten()
 
-            A_poly, b_poly, P_inv, c_ell, poly_time, nn_time = batched_results[k]
-            sum_poly_time += poly_time
-            sum_nn_time += nn_time
+            A_poly, b_poly, P_inv, c_ell, batch_call_time, python_postprocess_time, total_corridor_time = batched_results[k]
+            sum_batch_call_time += batch_call_time
+            sum_python_postprocess_time += python_postprocess_time
+            sum_total_corridor_time += total_corridor_time
 
             stage = {
                 'Qk': Qk * self.cost_scaling, 
@@ -1217,7 +1474,7 @@ class Planner:
             
             mpc_stage_dict[k] = stage
 
-        return mpc_stage_dict, sum_poly_time, sum_nn_time
+        return mpc_stage_dict, sum_batch_call_time, sum_python_postprocess_time, sum_total_corridor_time
     
     def step_once(self, current_state: np.ndarray, last_ctrl: np.ndarray, guesses: tuple,
                   map_obstacle: np.ndarray, guided_points: dict,
@@ -1254,7 +1511,7 @@ class Planner:
         state_horizon = X_guess 
 
         t_start_matrix = time.time()
-        mpc_stage_dict, sum_poly_time, sum_nn_time = self.get_mpc_matrix(
+        mpc_stage_dict, sum_batch_call_time, sum_python_postprocess_time, sum_total_corridor_time = self.get_mpc_matrix(
             state_horizon, map_obstacle, guided_points,
             target_velocity=target_velocity,
             weight_lat_scale=weight_lat_scale,
@@ -1282,8 +1539,12 @@ class Planner:
             'matrix_build_time': t_end_matrix - t_start_matrix,
             'solve_time': t_end_solve - t_start_solve,
             'total_time': (t_end_solve - t_start_solve) + (t_end_matrix - t_start_matrix),
-            'nn_inference_time': sum_nn_time,
-            'polygon_generation_time': sum_poly_time
+            'cpp_batch_call_time': sum_batch_call_time,
+            'python_postprocess_time': sum_python_postprocess_time,
+            'total_corridor_time': sum_total_corridor_time,
+            # 兼容旧日志字段
+            'nn_inference_time': sum_batch_call_time,
+            'polygon_generation_time': sum_python_postprocess_time
         }
 
         info['time_stats'] = time_stats
@@ -1430,13 +1691,11 @@ class Planner:
                         # 1. 绘制提取的安全椭圆 (黄虚线)
                         # ==========================================
                         try:
-                            sqrt_P = scipy.linalg.sqrtm(P_inv)
-                            if not np.iscomplexobj(sqrt_P):
-                                theta_vals = np.linspace(0, 2*np.pi, 50)
-                                ell_pts = np.vstack([np.cos(theta_vals), np.sin(theta_vals)])
-                                ell_world = c_ell[:, None] + sqrt_P @ ell_pts
-                                ax_map.plot(ell_world[0, :], ell_world[1, :], color='orange', alpha=0.5, linewidth=1.5, linestyle='--')
-                                ax_map.plot(c_ell[0], c_ell[1], 'x', color='orange', markersize=4)
+                            theta_vals = np.linspace(0, 2*np.pi, 50)
+                            ell_pts = np.vstack([np.cos(theta_vals), np.sin(theta_vals)])
+                            ell_world = c_ell[:, None] + P_inv @ ell_pts
+                            ax_map.plot(ell_world[0, :], ell_world[1, :], color='orange', alpha=0.5, linewidth=1.5, linestyle='--')
+                            ax_map.plot(c_ell[0], c_ell[1], 'x', color='orange', markersize=4)
                         except Exception:
                             pass
                             

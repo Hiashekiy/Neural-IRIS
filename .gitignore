@@ -34,12 +34,12 @@ ehthumbs.db
 Thumbs.db
 
 # C++ acceleration artifacts
-cpp_accel/build/
-cpp_accel/build_cpu/
-cpp_accel/build_gpu/
-cpp_accel/onnxruntime-win-*/
-cpp_accel/*.zip
-cpp_accel/sample_mask_*.txt
+cpp/build/
+cpp/build_cpu/
+cpp/build_gpu/
+cpp/onnxruntime-win-*/
+cpp/*.zip
+cpp/sample_mask_*.txt
 
 # Generated benchmark outputs
 experiment/metrics_results/*.npz

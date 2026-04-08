@@ -200,9 +200,14 @@ def render_step(render_objs, base_env, action_physical, traj_x, traj_y, velociti
                     if c_ell is not None and P_inv is not None:
                         theta_vals = np.linspace(0, 2*np.pi, 30)
                         ell_pts = np.vstack([np.cos(theta_vals), np.sin(theta_vals)])
-                        ell_world = c_ell[:, None] + P_inv @ ell_pts
-                        ell_patches[k].set_data(ell_world[0, :] / res, ell_world[1, :] / res)
-                        ell_patches[k].set_visible(True)
+                        # P_inv 直接把单位圆映射到椭圆边界（不需要再开方）。
+                        P_inv = np.asarray(P_inv, dtype=float)
+                        if P_inv.shape == (2, 2):
+                            ell_world = c_ell[:, None] + P_inv @ ell_pts
+                            ell_patches[k].set_data(ell_world[0, :] / res, ell_world[1, :] / res)
+                            ell_patches[k].set_visible(True)
+                        else:
+                            ell_patches[k].set_visible(False)
                     else:
                         ell_patches[k].set_visible(False)
                 except Exception:
@@ -333,15 +338,17 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
         step += 1
         if 'time_stats' in infos:
             t_stats = infos['time_stats']
-            nn_t = t_stats.get('nn_inference_time', 0.0)
-            poly_t = t_stats.get('polygon_generation_time', 0.0)
+            batch_call_t = t_stats.get('cpp_batch_call_time', t_stats.get('nn_inference_time', 0.0))
+            post_t = t_stats.get('python_postprocess_time', t_stats.get('polygon_generation_time', 0.0))
+            corridor_t = t_stats.get('total_corridor_time', batch_call_t + post_t)
             solve_t = t_stats.get('solve_time', 0.0)
             mat_t = t_stats.get('matrix_build_time', 0.0)
             tot_t = t_stats.get('total_time', 0.0)
             print(f"[Execution Time Stats - Step {step}]")
-            print(f"  -> NN Inference (cumulative): {nn_t*1000:.1f} ms")
-            print(f"  -> Polygon Generation (cumulative): {poly_t*1000:.1f} ms")
-            print(f"  -> Matrix Build Time (including NN & Poly): {mat_t*1000:.1f} ms")
+            print(f"  -> Batch Call (cumulative): {batch_call_t*1000:.1f} ms")
+            print(f"  -> Python Postprocess (cumulative): {post_t*1000:.1f} ms")
+            print(f"  -> Corridor Total (cumulative): {corridor_t*1000:.1f} ms")
+            print(f"  -> Matrix Build Time (including corridor): {mat_t*1000:.1f} ms")
             print(f"  -> MPC/HPIPM Solve Time: {solve_t*1000:.1f} ms")
             print(f"  => Total Step Planner Time: {tot_t*1000:.1f} ms\n")
 

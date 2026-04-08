@@ -16,7 +16,7 @@ def main(idx=0):
     idx = int(np.clip(idx, 0, len(patches) - 1))
     obs = (patches[idx] > 0.5).astype(np.uint8)
 
-    out_dir = os.path.join(ROOT, "cpp_accel")
+    out_dir = os.path.join(ROOT, "cpp")
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, f"sample_mask_{idx}.txt")
 
