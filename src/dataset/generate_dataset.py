@@ -12,6 +12,9 @@ import argparse
 import time
 import threading
 
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+DEFAULT_MAP_DIR = os.path.join(PROJECT_ROOT, "data", "street-map")
+
 try:
     import cvxopt
     from cvxopt import matrix, solvers
@@ -471,7 +474,7 @@ def generate_dataset(map_dir, output_file, density=0.02, patch_size=128, batch_s
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate IRIS training dataset")
-    parser.add_argument("--map-dir", type=str, default=r"D:\ProjectDirectory\GGMPC-dev\CorridorConstraints\data\street-map")
+    parser.add_argument("--map-dir", type=str, default=DEFAULT_MAP_DIR)
     parser.add_argument("--output", type=str, default="iris_dataset.npz")
     parser.add_argument("--density", type=float, default=0.02)
     parser.add_argument("--patch-size", type=int, default=128)
@@ -485,7 +488,6 @@ if __name__ == "__main__":
     if args.max_maps is not None:
         print(f"Preview mode enabled: only processing first {args.max_maps} maps.")
 
-    MAP_DIR = r"D:\ProjectDirectory\GGMPC-dev\CorridorConstraints\data\street-map"
     generate_dataset(
         args.map_dir,
         args.output,

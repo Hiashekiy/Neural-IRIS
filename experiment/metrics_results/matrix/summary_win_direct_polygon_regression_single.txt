@@ -1,6 +1,0 @@
-[Parameter Metrics Summary]
-samples=11986
-
-method                                valid  center_in  coll_rate  coll_area  norm_area     lat_ms
---------------------------------------------------------------------------------------------------
-direct_polygon_regression           100.00%    100.00%      0.00%     0.001%     nan        3.652

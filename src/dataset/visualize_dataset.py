@@ -132,7 +132,7 @@ def load_dataset(npz_path):
 
 def main():
     parser = argparse.ArgumentParser(description="Randomly visualize IRIS dataset samples.")
-    parser.add_argument("dataset", nargs="?", default="full_iris_dataset.npz", help="Path to the .npz dataset")
+    parser.add_argument("dataset", nargs="?", default="data\\iris-dataset\\full_iris_dataset.npz", help="Path to the .npz dataset")
     parser.add_argument("--batch-size", type=int, default=6, help="Number of samples shown per batch")
     parser.add_argument("--cols", type=int, default=3, help="Number of columns in the grid")
     parser.add_argument("--seed", type=int, default=None, help="Random seed for batch ordering")

@@ -3,8 +3,6 @@ import numpy as np
 import os
 import sys
 import time
-import torch
-import torch.nn.functional as F
 import cv2
 from scipy.spatial import cKDTree
 
@@ -16,15 +14,11 @@ if root_path not in sys.path:
     sys.path.append(root_path)
 
 from src.planner.car_model import DynamicModel
-from src.corridor_constraints.generate_safe_polygon import generate_safe_polygon
-from src.corridor_constraints.geometry import parse_network_output
-from src.corridor_constraints.model import CorridorEllipseNet
+from src.neural_iris import infer_safe_region_batch_halfspaces as py_infer_safe_region_batch_halfspaces
 try:
-    from experiment.ours_corridor_cpp.method import infer_polygon_batch as cpp_infer_polygon_batch
-    from experiment.ours_corridor_cpp.method import infer_polygon_batch_with_ellipse as cpp_infer_polygon_batch_with_ellipse
+    from cpp.python import infer_safe_region_batch_halfspaces as cpp_infer_safe_region_batch_halfspaces
 except Exception:
-    cpp_infer_polygon_batch = None
-    cpp_infer_polygon_batch_with_ellipse = None
+    cpp_infer_safe_region_batch_halfspaces = None
 from hpipm_python import (hpipm_ocp_qp_dim, hpipm_ocp_qp,
                           hpipm_ocp_qp_sol, hpipm_ocp_qp_solver_arg, hpipm_ocp_qp_solver)
 
@@ -99,20 +93,8 @@ class Planner:
         self.pos_ub = np.array([100.0, 100.0])
         
         # 优先使用 C++ GPU 批量通道生成。
-        os.environ.setdefault("OURS_CPP_BACKEND", "gpu")
-        self.use_cpp_corridor = cpp_infer_polygon_batch is not None
-        if not self.use_cpp_corridor:
-            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            self.iris_net = CorridorEllipseNet().to(self.device)
-            model_path = os.path.abspath(os.path.join(os.path.dirname(__file__), '../../models/iris_net_best.pth'))
-            if os.path.exists(model_path):
-                try:
-                    self.iris_net.load_state_dict(torch.load(model_path, map_location=self.device))
-                    self.iris_net.eval()
-                except Exception as e:
-                    print(f"Failed to load CorridorEllipseNet weights: {e}")
-            else:
-                print(f"Warning: CorridorEllipseNet model path unreached: {model_path}")
+        os.environ.setdefault("NEURAL_IRIS_CPP_BACKEND", "gpu")
+        self.use_cpp_neural_iris = cpp_infer_safe_region_batch_halfspaces is not None
         self.patch_size = 128
         
         # 初始化 HPIPM (高性能内点法) QP 求解器
@@ -212,22 +194,19 @@ class Planner:
         
         return cKDTree(local_obs), local_obs
 
-    def _predict_ellipse_corridors_batched(self, occupancy_map, states_xy_list, map_resolution, max_bound=10.0):
-        # 批量神经网络推理
+    def _predict_safe_regions_batched(self, occupancy_map, states_xy_list, map_resolution, max_bound=10.0):
         batch_size = len(states_xy_list)
 
         patch_np_list = []
-        obs_points_list = []
         c_x_ints = []
         c_y_ints = []
-        
+
         local_radius_m = 10.0
         r_pixel_f = local_radius_m / map_resolution
         r_pixel = int(np.round(r_pixel_f))
         side_len = int(2 * r_pixel)
-        
+
         h, w = occupancy_map.shape
-        
         for state_xy in states_xy_list:
             cx_f = state_xy[0] / map_resolution
             cy_f = state_xy[1] / map_resolution
@@ -235,849 +214,179 @@ class Planner:
             c_y_int = int(np.round(cy_f))
             c_x_ints.append(c_x_int)
             c_y_ints.append(c_y_int)
-            
+
             raw_patch = np.zeros((side_len, side_len), dtype=np.uint8)
-            
+
             x_min_map = c_x_int - r_pixel
             x_max_map = c_x_int + r_pixel
             y_min_map = c_y_int - r_pixel
             y_max_map = c_y_int + r_pixel
-            
+
             valid_x_min = max(0, x_min_map)
             valid_x_max = min(w, x_max_map)
             valid_y_min = max(0, y_min_map)
             valid_y_max = min(h, y_max_map)
-            
+
             p_x_min = valid_x_min - x_min_map
             p_x_max = side_len - (x_max_map - valid_x_max)
             p_y_min = valid_y_min - y_min_map
             p_y_max = side_len - (y_max_map - valid_y_max)
-            
+
             if valid_y_max > valid_y_min and valid_x_max > valid_x_min:
                 raw_patch[p_y_min:p_y_max, p_x_min:p_x_max] = occupancy_map[valid_y_min:valid_y_max, valid_x_min:valid_x_max]
-            
-            patch_np = cv2.resize(raw_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST).astype(np.float32)
+
+            patch_np = cv2.resize(
+                raw_patch,
+                (self.patch_size, self.patch_size),
+                interpolation=cv2.INTER_NEAREST,
+            ).astype(np.float32)
             patch_np_list.append(patch_np)
-            
-            obs_y, obs_x = np.where(patch_np >= 0.5)
-            if len(obs_x) > 0:
-                # 加入轻量降采样，步长为 2 可以在不损失包络精度的前提下直接砍掉 75% 的二次型测距计算量
-                obs_y = obs_y[::2]
-                obs_x = obs_x[::2]
-                obs_points_list.append(np.column_stack((obs_x, obs_y)).astype(float))
-            else:
-                obs_points_list.append(np.array([]))
-                
-        if self.use_cpp_corridor and cpp_infer_polygon_batch is not None:
-            def _polygon_to_halfspaces(poly_world: np.ndarray, center_world: np.ndarray):
-                A_poly = np.zeros((self.N_faces, 2))
-                b_poly = np.zeros(self.N_faces)
 
-                if poly_world is None or len(poly_world) < 3:
-                    A_poly[:4, :] = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
-                    b_poly[0] = center_world[0] + 1.0
-                    b_poly[1] = -(center_world[0] - 1.0)
-                    b_poly[2] = center_world[1] + 1.0
-                    b_poly[3] = -(center_world[1] - 1.0)
-                    b_poly[4:] = 1e5
-                    return A_poly, b_poly, center_world.copy()
-
-                poly_world = np.asarray(poly_world, dtype=float)
-                signed_area = 0.5 * float(np.sum(poly_world[:, 0] * np.roll(poly_world[:, 1], -1) - poly_world[:, 1] * np.roll(poly_world[:, 0], -1)))
-                if signed_area < 0.0:
-                    poly_world = poly_world[::-1]
-
-                valid_num = 0
-                centroid = poly_world.mean(axis=0)
-                for i in range(len(poly_world)):
-                    p1 = poly_world[i]
-                    p2 = poly_world[(i + 1) % len(poly_world)]
-                    dx = p2[0] - p1[0]
-                    dy = p2[1] - p1[1]
-                    length = math.hypot(dx, dy)
-                    if length < 1e-8:
-                        continue
-                    nx = dy / length
-                    ny = -dx / length
-                    A_poly[valid_num] = [nx, ny]
-                    b_poly[valid_num] = nx * p1[0] + ny * p1[1] - self.r_safe
-                    valid_num += 1
-                    if valid_num >= self.N_faces:
-                        break
-
-                if valid_num < self.N_faces:
-                    b_poly[valid_num:] = 1e5
-
-                return A_poly, b_poly, centroid
-
-            def _safe_visual_shape(A_poly: np.ndarray, b_poly: np.ndarray, c_world: np.ndarray):
-                # 为可视化构造一个保证在 A x <= b 内部的保守内接圆。
-                # 绘制端使用 c + P_inv @ unit_circle，因此这里返回 r I。
-                valid = (np.linalg.norm(A_poly, axis=1) > 1e-8) & (b_poly < 1e4)
-                if not np.any(valid):
-                    return np.eye(2)
-                A_v = A_poly[valid]
-                b_v = b_poly[valid]
-                margins = b_v - (A_v @ c_world)
-                if margins.size == 0:
-                    return np.eye(2)
-                r = float(np.min(margins))
-                if not np.isfinite(r) or r <= 1e-3:
-                    r = 1e-3
-                return r * np.eye(2)
-
-            t_start_nn = time.time()
-            try:
-                if cpp_infer_polygon_batch_with_ellipse is not None:
-                    poly_batch, p_batch, c_batch = cpp_infer_polygon_batch_with_ellipse(
-                        np.asarray(patch_np_list, dtype=np.float32), patch_size=self.patch_size
-                    )
-                else:
-                    poly_batch = cpp_infer_polygon_batch(np.asarray(patch_np_list, dtype=np.float32), patch_size=self.patch_size)
-                    p_batch = [None for _ in range(batch_size)]
-                    c_batch = [None for _ in range(batch_size)]
-            except Exception as e:
-                print(f"[Planner] C++ corridor batch failed, fallback to empty corridors: {e}")
-                poly_batch = [None for _ in range(batch_size)]
-                p_batch = [None for _ in range(batch_size)]
-                c_batch = [None for _ in range(batch_size)]
-            t_end_nn = time.time()
-            nn_time = t_end_nn - t_start_nn
-
-            results = []
-            for k in range(batch_size):
-                physical_center_x = c_x_ints[k] * map_resolution
-                physical_center_y = c_y_ints[k] * map_resolution
-                center_world = np.array([physical_center_x, physical_center_y], dtype=float)
-
-                t1 = time.time()
-                poly_points = poly_batch[k] if k < len(poly_batch) else None
-                if poly_points is not None:
-                    poly_points = np.asarray(poly_points, dtype=float)
-                if poly_points is not None and len(poly_points) >= 3:
-                    poly_world = (poly_points - r_center) * mapped_resolution + center_world[None, :]
-                    A_poly, b_poly, c_world_poly = _polygon_to_halfspaces(poly_world, center_world)
-                    p_pixel = p_batch[k] if k < len(p_batch) else None
-                    c_pixel = c_batch[k] if k < len(c_batch) else None
-                    if p_pixel is not None and c_pixel is not None:
-                        c_world = np.array([
-                            (float(c_pixel[0]) - r_center) * mapped_resolution + physical_center_x,
-                            (float(c_pixel[1]) - r_center) * mapped_resolution + physical_center_y,
-                        ])
-                        try:
-                            P_inv_world = np.linalg.inv(np.asarray(p_pixel, dtype=float)) * mapped_resolution
-                        except np.linalg.LinAlgError:
-                            P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
-                    else:
-                        c_world = c_world_poly
-                        P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
-                else:
-                    A_poly = np.zeros((self.N_faces, 2))
-                    b_poly = np.zeros(self.N_faces)
-                    A_poly[:4, :] = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
-                    b_poly[0] = center_world[0] + 1.0
-                    b_poly[1] = -(center_world[0] - 1.0)
-                    b_poly[2] = center_world[1] + 1.0
-                    b_poly[3] = -(center_world[1] - 1.0)
-                    b_poly[4:] = 1e5
-                    c_world = center_world
-                    P_inv_world = np.eye(2)
-
-                poly_time = time.time() - t1
-                results.append((A_poly, b_poly, P_inv_world, c_world, poly_time, nn_time / max(1, batch_size)))
-
-            return results
-
-        t_start_nn = time.time()
-        
-        # 直接使用 non_blocking=True 加速 H2D 拷贝，并激活 AMP
-        batch_tensor = torch.from_numpy(np.array(patch_np_list)).float().unsqueeze(1).to(self.device, non_blocking=True)
-        with torch.no_grad(), torch.amp.autocast('cuda'):
-            pred_batch_tensor = self.iris_net(batch_tensor)
-            
-        # 显式同步 GPU 确保计时测量的是真实的纯网络耗时
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-            
-        t_end_nn = time.time()
-        nn_time = t_end_nn - t_start_nn
-        
         mapped_resolution = (2.0 * local_radius_m) / self.patch_size
         r_center = self.patch_size / 2.0
-        
-        results = []
-        for k in range(batch_size):
-            pred_tensor = pred_batch_tensor[k]
-            P_pixel, c_pixel = parse_network_output(pred_tensor, self.patch_size)
-            
-            physical_center_x = c_x_ints[k] * map_resolution
-            physical_center_y = c_y_ints[k] * map_resolution
-            
-            c_world = np.array([
-                (c_pixel[0] - r_center) * mapped_resolution + physical_center_x,
-                (c_pixel[1] - r_center) * mapped_resolution + physical_center_y
-            ])
-            
-            try:
-                P_inv_world = np.linalg.inv(P_pixel) * mapped_resolution
-            except np.linalg.LinAlgError:
-                P_inv_world = np.eye(2) * (r_pixel_f * map_resolution)
-                
-            t1 = time.time()
-            # 配合底层修改，这里直接接收不等式矩阵 A_pix 和 b_pix，不再计算顶点
-            A_pix, b_pix = generate_safe_polygon(P_pixel, c_pixel, obs_points_list[k], patch_size=self.patch_size)
-            poly_time = time.time() - t1
-            
+
+        def _empty_world_region(center_world: np.ndarray):
             A_poly = np.zeros((self.N_faces, 2))
             b_poly = np.zeros(self.N_faces)
-            
-            if A_pix is not None and len(A_pix) > 0:
-                # --- O(1) 向量化坐标系仿射映射 ---
-                # 1. 转换 A_pix 到世界坐标系
+            A_poly[:4, :] = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
+            b_poly[0] = center_world[0] + 1.0
+            b_poly[1] = -(center_world[0] - 1.0)
+            b_poly[2] = center_world[1] + 1.0
+            b_poly[3] = -(center_world[1] - 1.0)
+            b_poly[4:] = 1e5
+            return A_poly, b_poly, np.eye(2), center_world.copy()
+
+        def _safe_visual_shape(A_poly: np.ndarray, b_poly: np.ndarray, c_world: np.ndarray):
+            valid = (np.linalg.norm(A_poly, axis=1) > 1e-8) & (b_poly < 1e4)
+            if not np.any(valid):
+                return np.eye(2)
+            A_v = A_poly[valid]
+            b_v = b_poly[valid]
+            margins = b_v - (A_v @ c_world)
+            if margins.size == 0:
+                return np.eye(2)
+            r = float(np.min(margins))
+            if not np.isfinite(r) or r <= 1e-3:
+                r = 1e-3
+            return r * np.eye(2)
+
+        def _project_halfspaces_to_world(a_pix, b_pix, p_pixel, c_pixel, center_world: np.ndarray):
+            if c_pixel is not None:
+                c_world = np.array([
+                    (float(c_pixel[0]) - r_center) * mapped_resolution + center_world[0],
+                    (float(c_pixel[1]) - r_center) * mapped_resolution + center_world[1],
+                ])
+            else:
+                c_world = center_world.copy()
+
+            A_poly = np.zeros((self.N_faces, 2))
+            b_poly = np.zeros(self.N_faces)
+            if a_pix is not None and b_pix is not None and len(a_pix) > 0:
+                A_pix = np.asarray(a_pix, dtype=float)
+                b_pix = np.asarray(b_pix, dtype=float)
+
                 A_world = A_pix / mapped_resolution
-                
-                # 过滤并归一化法向量
                 norms = np.linalg.norm(A_world, axis=1)
                 valid_mask = norms > 1e-5
-                
+
                 A_world = A_world[valid_mask]
                 b_pix = b_pix[valid_mask]
                 A_pix = A_pix[valid_mask]
                 norms = norms[valid_mask]
-                
+
+                if len(norms) == 0:
+                    return _empty_world_region(center_world)
+
                 A_world_norm = A_world / norms[:, None]
-                
-                # 2. 转换 b_pix 到世界坐标系
-                center_phys = np.array([physical_center_x, physical_center_y])
                 offset_pix = np.dot(A_pix, np.array([r_center, r_center]))
-                offset_phys = np.dot(A_world, center_phys)
+                offset_phys = np.dot(A_world, center_world)
                 b_world_raw = b_pix - offset_pix + offset_phys
-                
                 b_world_norm = b_world_raw / norms
-                
-                # 3. 引入车辆物理安全半径 (向内收缩)
                 b_world_safe = b_world_norm - self.r_safe
-                
-                # 4. 计算到局部视野中心的垂直距离进行重要性排序
                 dists = np.abs(np.dot(A_world_norm, c_world) - b_world_norm)
-                
+
                 valid_num = len(b_world_safe)
                 if valid_num > self.N_faces:
                     idx = np.argsort(dists)[:self.N_faces]
                     A_world_norm = A_world_norm[idx]
                     b_world_safe = b_world_safe[idx]
                     valid_num = self.N_faces
-                    
+
                 A_poly[:valid_num] = A_world_norm
                 b_poly[:valid_num] = b_world_safe
-                
-                # 不足 N_faces 用无效边界填满
                 if valid_num < self.N_faces:
                     b_poly[valid_num:] = 1e5
             else:
-                # 极速降级包络：防退化保护
-                A_poly[:4, :] = np.array([[1,0], [-1,0], [0,1], [0,-1]])
-                b_poly[0] = c_world[0] + 1.0
-                b_poly[1] = -(c_world[0] - 1.0)
-                b_poly[2] = c_world[1] + 1.0
-                b_poly[3] = -(c_world[1] - 1.0)
-                b_poly[4:] = 1e5
-                
-            results.append((A_poly, b_poly, P_inv_world, c_world, poly_time, nn_time / batch_size))
-            
-        return results
+                return _empty_world_region(center_world)
 
-    def _predict_ellipse_corridors_batched(self, occupancy_map, states_xy_list, map_resolution, max_bound=10.0):
-        # 批量神经网络推理
-        batch_size = len(states_xy_list)
-        import cv2
-        import torch
-        import time
-        import math
-        
-        patch_np_list = []
-        obs_points_list = []
-        c_x_ints = []
-        c_y_ints = []
-        
-        local_radius_m = 10.0
-        r_pixel_f = local_radius_m / map_resolution
-        r_pixel = int(np.round(r_pixel_f))
-        side_len = int(2 * r_pixel)
-        
-        h, w = occupancy_map.shape
-        
-        for state_xy in states_xy_list:
-            cx_f = state_xy[0] / map_resolution
-            cy_f = state_xy[1] / map_resolution
-            c_x_int = int(np.round(cx_f))
-            c_y_int = int(np.round(cy_f))
-            c_x_ints.append(c_x_int)
-            c_y_ints.append(c_y_int)
-            
-            raw_patch = np.zeros((side_len, side_len), dtype=np.uint8)
-            
-            x_min_map = c_x_int - r_pixel
-            x_max_map = c_x_int + r_pixel
-            y_min_map = c_y_int - r_pixel
-            y_max_map = c_y_int + r_pixel
-            
-            valid_x_min = max(0, x_min_map)
-            valid_x_max = min(w, x_max_map)
-            valid_y_min = max(0, y_min_map)
-            valid_y_max = min(h, y_max_map)
-            
-            p_x_min = valid_x_min - x_min_map
-            p_x_max = side_len - (x_max_map - valid_x_max)
-            p_y_min = valid_y_min - y_min_map
-            p_y_max = side_len - (y_max_map - valid_y_max)
-            
-            if valid_y_max > valid_y_min and valid_x_max > valid_x_min:
-                raw_patch[p_y_min:p_y_max, p_x_min:p_x_max] = occupancy_map[valid_y_min:valid_y_max, valid_x_min:valid_x_max]
-            
-            patch_np = cv2.resize(raw_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST).astype(np.float32)
-            patch_np_list.append(patch_np)
-            
-            obs_y, obs_x = np.where(patch_np >= 0.5)
-            if len(obs_x) > 0:
-                obs_points_list.append(np.column_stack((obs_x, obs_y)).astype(float))
+            if p_pixel is not None:
+                try:
+                    P_inv_world = np.linalg.inv(np.asarray(p_pixel, dtype=float)) * mapped_resolution
+                except np.linalg.LinAlgError:
+                    P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
             else:
-                obs_points_list.append(np.array([]))
-                
-        t_start_nn = time.time()
-        
-        batch_tensor = torch.from_numpy(np.array(patch_np_list)).float().unsqueeze(1).to(self.device)
-        with torch.no_grad():
-            pred_batch_tensor = self.iris_net(batch_tensor)
-            
-        t_end_nn = time.time()
-        nn_time = t_end_nn - t_start_nn
-        
-        mapped_resolution = (2.0 * local_radius_m) / self.patch_size
-        r_center = self.patch_size / 2.0
-        
-        results = []
-        for k in range(batch_size):
-            pred_tensor = pred_batch_tensor[k]
-            P_pixel, c_pixel = parse_network_output(pred_tensor, self.patch_size)
-            
-            physical_center_x = c_x_ints[k] * map_resolution
-            physical_center_y = c_y_ints[k] * map_resolution
-            
-            c_world = np.array([
-                (c_pixel[0] - r_center) * mapped_resolution + physical_center_x,
-                (c_pixel[1] - r_center) * mapped_resolution + physical_center_y
-            ])
-            
-            try:
-                P_inv_world = np.linalg.inv(P_pixel) * mapped_resolution
-            except np.linalg.LinAlgError:
-                P_inv_world = np.eye(2) * (r_pixel_f * map_resolution)
-                
-            t1 = time.time()
-            poly_points = generate_safe_polygon(P_pixel, c_pixel, obs_points_list[k], patch_size=self.patch_size)
-            poly_time = time.time() - t1
-            
-            A_poly = np.zeros((self.N_faces, 2))
-            b_poly = np.zeros(self.N_faces)
-            
-            if poly_points is not None and len(poly_points) >= 3:
-                poly_world = (poly_points - r_center) * mapped_resolution + np.array([physical_center_x, physical_center_y])
-                M = len(poly_world)
-                normals = []
-                bs = []
-                dists = []
-                for i in range(M):
-                    p1 = poly_world[i]
-                    p2 = poly_world[(i + 1) % M]
-                    dx = p2[0] - p1[0]
-                    dy = p2[1] - p1[1]
-                    length = math.hypot(dx, dy)
-                    if length < 1e-5:
-                        continue
-                    nx = dy / length
-                    ny = -dx / length
-                    b_val = (nx * p1[0] + ny * p1[1]) - self.r_safe
-                    dist_to_center = abs(nx * c_world[0] + ny * c_world[1] - (b_val + self.r_safe))
-                    normals.append([nx, ny])
-                    bs.append(b_val)
-                    dists.append(dist_to_center)
-                    
-                if normals:
-                    normals = np.array(normals)
-                    bs = np.array(bs)
-                    dists = np.array(dists)
-                    valid_num = len(bs)
-                    if valid_num > self.N_faces:
-                        idx = np.argsort(dists)[:self.N_faces]
-                        normals = normals[idx]
-                        bs = bs[idx]
-                        valid_num = self.N_faces
-                    A_poly[:valid_num] = normals
-                    b_poly[:valid_num] = bs
-            results.append((A_poly, b_poly, P_inv_world, c_world, poly_time, nn_time / batch_size))
-            
-        return results
-    
-    def _predict_ellipse_corridors_batched(self, occupancy_map, states_xy_list, map_resolution, max_bound=10.0):
-        # 批量神经网络推理
-        batch_size = len(states_xy_list)
-        
-        patch_np_list = []
-        obs_points_list = []
-        c_x_ints = []
-        c_y_ints = []
-        
-        local_radius_m = 10.0
-        r_pixel_f = local_radius_m / map_resolution
-        r_pixel = int(np.round(r_pixel_f))
-        side_len = int(2 * r_pixel)
-        
-        h, w = occupancy_map.shape
+                P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
 
-        # === 新增优化：计算整个 Batch 的联合 ROI 包围盒 ===
-        if batch_size > 0:
-            # 预先计算所有状态点的像素坐标
-            cx_ints_temp = [int(np.round(st[0] / map_resolution)) for st in states_xy_list]
-            cy_ints_temp = [int(np.round(st[1] / map_resolution)) for st in states_xy_list]
-            
-            # 划定包含所有预测点和感受野的最小外接矩形 (包含边界保护)
-            roi_min_x = max(0, min(cx_ints_temp) - r_pixel)
-            roi_max_x = min(w, max(cx_ints_temp) + r_pixel)
-            roi_min_y = max(0, min(cy_ints_temp) - r_pixel)
-            roi_max_y = min(h, max(cy_ints_temp) + r_pixel)
-            
-            # 仅截取包含当前批次轨迹的局部小图进行形态学边缘提取
-            if roi_max_x > roi_min_x and roi_max_y > roi_min_y:
-                roi_occupancy = occupancy_map[roi_min_y:roi_max_y, roi_min_x:roi_max_x]
-                kernel = np.array([[0, 1, 0], 
-                                [1, 1, 1], 
-                                [0, 1, 0]], dtype=np.uint8)
-                roi_boundary = cv2.morphologyEx(roi_occupancy, cv2.MORPH_GRADIENT, kernel)
-            else:
-                roi_boundary = np.zeros((0, 0), dtype=np.uint8)
-        # ===================================================
+            return A_poly, b_poly, P_inv_world, c_world
 
-        for state_xy in states_xy_list:
-            cx_f = state_xy[0] / map_resolution
-            cy_f = state_xy[1] / map_resolution
-            c_x_int = int(np.round(cx_f))
-            c_y_int = int(np.round(cy_f))
-            c_x_ints.append(c_x_int)
-            c_y_ints.append(c_y_int)
-            
-            raw_patch = np.zeros((side_len, side_len), dtype=np.uint8)
-            bound_patch = np.zeros((side_len, side_len), dtype=np.uint8)
-            
-            x_min_map = c_x_int - r_pixel
-            x_max_map = c_x_int + r_pixel
-            y_min_map = c_y_int - r_pixel
-            y_max_map = c_y_int + r_pixel
-            
-            valid_x_min = max(0, x_min_map)
-            valid_x_max = min(w, x_max_map)
-            valid_y_min = max(0, y_min_map)
-            valid_y_max = min(h, y_max_map)
-            
-            p_x_min = valid_x_min - x_min_map
-            p_x_max = side_len - (x_max_map - valid_x_max)
-            p_y_min = valid_y_min - y_min_map
-            p_y_max = side_len - (y_max_map - valid_y_max)
-            
-            if valid_y_max > valid_y_min and valid_x_max > valid_x_min:
-                # 原始占据地图用于神经网络推理
-                raw_patch[p_y_min:p_y_max, p_x_min:p_x_max] = occupancy_map[valid_y_min:valid_y_max, valid_x_min:valid_x_max]
-                
-                # 从联合 ROI 边界图中截取对应区域 (使用相对坐标计算)
-                roi_rel_x_min = valid_x_min - roi_min_x
-                roi_rel_x_max = valid_x_max - roi_min_x
-                roi_rel_y_min = valid_y_min - roi_min_y
-                roi_rel_y_max = valid_y_max - roi_min_y
-                bound_patch[p_y_min:p_y_max, p_x_min:p_x_max] = roi_boundary[roi_rel_y_min:roi_rel_y_max, roi_rel_x_min:roi_rel_x_max]
-            
-            patch_np = cv2.resize(raw_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST).astype(np.float32)
-            patch_np_list.append(patch_np)
-            
-            # 寻找障碍物边界坐标
-            bound_patch_resized = cv2.resize(bound_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST)
-            obs_y, obs_x = np.where(bound_patch_resized >= 0.5)
-            
-            if len(obs_x) > 0:
-                # 直接输入所有真实的边界点，抛弃危险的步长降采样
-                obs_points_list.append(np.column_stack((obs_x, obs_y)).astype(float))
-            else:
-                obs_points_list.append(np.array([]))
-
-        mapped_resolution = (2.0 * local_radius_m) / self.patch_size
-        r_center = self.patch_size / 2.0
-
-        if self.use_cpp_corridor and cpp_infer_polygon_batch is not None:
-            def _polygon_to_halfspaces(poly_world: np.ndarray, center_world: np.ndarray):
-                A_poly = np.zeros((self.N_faces, 2))
-                b_poly = np.zeros(self.N_faces)
-
-                if poly_world is None or len(poly_world) < 3:
-                    A_poly[:4, :] = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
-                    b_poly[0] = center_world[0] + 1.0
-                    b_poly[1] = -(center_world[0] - 1.0)
-                    b_poly[2] = center_world[1] + 1.0
-                    b_poly[3] = -(center_world[1] - 1.0)
-                    b_poly[4:] = 1e5
-                    return A_poly, b_poly, center_world.copy()
-
-                poly_world = np.asarray(poly_world, dtype=float)
-                signed_area = 0.5 * float(np.sum(poly_world[:, 0] * np.roll(poly_world[:, 1], -1) - poly_world[:, 1] * np.roll(poly_world[:, 0], -1)))
-                if signed_area < 0.0:
-                    poly_world = poly_world[::-1]
-
-                valid_num = 0
-                centroid = poly_world.mean(axis=0)
-                for i in range(len(poly_world)):
-                    p1 = poly_world[i]
-                    p2 = poly_world[(i + 1) % len(poly_world)]
-                    dx = p2[0] - p1[0]
-                    dy = p2[1] - p1[1]
-                    length = math.hypot(dx, dy)
-                    if length < 1e-8:
-                        continue
-                    nx = dy / length
-                    ny = -dx / length
-                    A_poly[valid_num] = [nx, ny]
-                    b_poly[valid_num] = nx * p1[0] + ny * p1[1] - self.r_safe
-                    valid_num += 1
-                    if valid_num >= self.N_faces:
-                        break
-
-                if valid_num < self.N_faces:
-                    b_poly[valid_num:] = 1e5
-
-                return A_poly, b_poly, centroid
-
-            def _safe_visual_shape(A_poly: np.ndarray, b_poly: np.ndarray, c_world: np.ndarray):
-                # 为可视化构造一个保证在 A x <= b 内部的保守内接圆。
-                # 绘制端使用 c + P_inv @ unit_circle，因此这里返回 r I。
-                valid = (np.linalg.norm(A_poly, axis=1) > 1e-8) & (b_poly < 1e4)
-                if not np.any(valid):
-                    return np.eye(2)
-                A_v = A_poly[valid]
-                b_v = b_poly[valid]
-                margins = b_v - (A_v @ c_world)
-                if margins.size == 0:
-                    return np.eye(2)
-                r = float(np.min(margins))
-                if not np.isfinite(r) or r <= 1e-3:
-                    r = 1e-3
-                return r * np.eye(2)
-
+        if self.use_cpp_neural_iris and cpp_infer_safe_region_batch_halfspaces is not None:
             t_start_nn = time.time()
             try:
-                if cpp_infer_polygon_batch_with_ellipse is not None:
-                    poly_batch, p_batch, c_batch = cpp_infer_polygon_batch_with_ellipse(
-                        np.asarray(patch_np_list, dtype=np.float32), patch_size=self.patch_size
-                    )
-                else:
-                    poly_batch = cpp_infer_polygon_batch(np.asarray(patch_np_list, dtype=np.float32), patch_size=self.patch_size)
-                    p_batch = [None for _ in range(batch_size)]
-                    c_batch = [None for _ in range(batch_size)]
+                a_batch, b_batch, p_batch, c_batch = cpp_infer_safe_region_batch_halfspaces(
+                    np.asarray(patch_np_list, dtype=np.float32),
+                    patch_size=self.patch_size,
+                )
             except Exception as e:
-                print(f"[Planner] C++ corridor batch failed, fallback to empty corridors: {e}")
-                poly_batch = [None for _ in range(batch_size)]
+                print(f"[Planner] Neural-IRIS C++ batch failed, fallback to empty safe regions: {e}")
+                a_batch = [None for _ in range(batch_size)]
+                b_batch = [None for _ in range(batch_size)]
+                p_batch = [None for _ in range(batch_size)]
+                c_batch = [None for _ in range(batch_size)]
+            batch_call_time = time.time() - t_start_nn
+        else:
+            t_start_nn = time.time()
+            try:
+                a_batch, b_batch, p_batch, c_batch = py_infer_safe_region_batch_halfspaces(
+                    np.asarray(patch_np_list, dtype=np.float32),
+                    patch_size=self.patch_size,
+                )
+            except Exception as e:
+                print(f"[Planner] Neural-IRIS Python batch failed, fallback to empty safe regions: {e}")
+                a_batch = [None for _ in range(batch_size)]
+                b_batch = [None for _ in range(batch_size)]
                 p_batch = [None for _ in range(batch_size)]
                 c_batch = [None for _ in range(batch_size)]
             batch_call_time = time.time() - t_start_nn
 
-            results = []
-            for k in range(batch_size):
-                physical_center_x = c_x_ints[k] * map_resolution
-                physical_center_y = c_y_ints[k] * map_resolution
-                center_world = np.array([physical_center_x, physical_center_y], dtype=float)
-
-                t1 = time.time()
-                poly_points = poly_batch[k] if k < len(poly_batch) else None
-                if poly_points is not None:
-                    poly_points = np.asarray(poly_points, dtype=float)
-                if poly_points is not None and len(poly_points) >= 3:
-                    poly_world = (poly_points - r_center) * mapped_resolution + center_world[None, :]
-                    A_poly, b_poly, c_world_poly = _polygon_to_halfspaces(poly_world, center_world)
-                    p_pixel = p_batch[k] if k < len(p_batch) else None
-                    c_pixel = c_batch[k] if k < len(c_batch) else None
-                    if p_pixel is not None and c_pixel is not None:
-                        c_world = np.array([
-                            (float(c_pixel[0]) - r_center) * mapped_resolution + physical_center_x,
-                            (float(c_pixel[1]) - r_center) * mapped_resolution + physical_center_y,
-                        ])
-                        try:
-                            P_inv_world = np.linalg.inv(np.asarray(p_pixel, dtype=float)) * mapped_resolution
-                        except np.linalg.LinAlgError:
-                            P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
-                    else:
-                        c_world = c_world_poly
-                        P_inv_world = _safe_visual_shape(A_poly, b_poly, c_world)
-                else:
-                    A_poly = np.zeros((self.N_faces, 2))
-                    b_poly = np.zeros(self.N_faces)
-                    A_poly[:4, :] = np.array([[1, 0], [-1, 0], [0, 1], [0, -1]])
-                    b_poly[0] = center_world[0] + 1.0
-                    b_poly[1] = -(center_world[0] - 1.0)
-                    b_poly[2] = center_world[1] + 1.0
-                    b_poly[3] = -(center_world[1] - 1.0)
-                    b_poly[4:] = 1e5
-                    c_world = center_world
-                    P_inv_world = np.eye(2)
-
-                python_postprocess_time = time.time() - t1
-                per_item_batch_call_time = batch_call_time / max(1, batch_size)
-                total_corridor_time = per_item_batch_call_time + python_postprocess_time
-                results.append((A_poly, b_poly, P_inv_world, c_world, per_item_batch_call_time, python_postprocess_time, total_corridor_time))
-
-            return results
-                
-        t_start_nn = time.time()
-        
-        batch_tensor = torch.from_numpy(np.array(patch_np_list)).float().unsqueeze(1).to(self.device)
-        with torch.no_grad():
-            pred_batch_tensor = self.iris_net(batch_tensor)
-            
-        t_end_nn = time.time()
-        batch_call_time = t_end_nn - t_start_nn
-        
-        mapped_resolution = (2.0 * local_radius_m) / self.patch_size
-        r_center = self.patch_size / 2.0
-        
         results = []
+        per_item_batch_call_time = batch_call_time / max(1, batch_size)
         for k in range(batch_size):
-            pred_tensor = pred_batch_tensor[k]
-            P_pixel, c_pixel = parse_network_output(pred_tensor, self.patch_size)
-            
-            physical_center_x = c_x_ints[k] * map_resolution
-            physical_center_y = c_y_ints[k] * map_resolution
-            
-            c_world = np.array([
-                (c_pixel[0] - r_center) * mapped_resolution + physical_center_x,
-                (c_pixel[1] - r_center) * mapped_resolution + physical_center_y
-            ])
-            
-            try:
-                P_inv_world = np.linalg.inv(P_pixel) * mapped_resolution
-            except np.linalg.LinAlgError:
-                P_inv_world = np.eye(2) * (r_pixel_f * map_resolution)
-                
-            t1 = time.time()
-            # 配合底层修改，这里直接接收不等式矩阵 A_pix 和 b_pix，不再计算顶点
-            A_pix, b_pix = generate_safe_polygon(P_pixel, c_pixel, obs_points_list[k], patch_size=self.patch_size)
-            python_postprocess_time = time.time() - t1
-            
-            A_poly = np.zeros((self.N_faces, 2))
-            b_poly = np.zeros(self.N_faces)
-            
-            if A_pix is not None and len(A_pix) > 0:
-                # --- O(1) 向量化坐标系仿射映射 ---
-                # 1. 转换 A_pix 到世界坐标系
-                A_world = A_pix / mapped_resolution
-                
-                # 过滤并归一化法向量
-                norms = np.linalg.norm(A_world, axis=1)
-                valid_mask = norms > 1e-5
-                
-                A_world = A_world[valid_mask]
-                b_pix = b_pix[valid_mask]
-                A_pix = A_pix[valid_mask]
-                norms = norms[valid_mask]
-                
-                A_world_norm = A_world / norms[:, None]
-                
-                # 2. 转换 b_pix 到世界坐标系
-                center_phys = np.array([physical_center_x, physical_center_y])
-                offset_pix = np.dot(A_pix, np.array([r_center, r_center]))
-                offset_phys = np.dot(A_world, center_phys)
-                b_world_raw = b_pix - offset_pix + offset_phys
-                
-                b_world_norm = b_world_raw / norms
-                
-                # 3. 引入车辆物理安全半径 (向内收缩)
-                b_world_safe = b_world_norm - self.r_safe
-                
-                # 4. 计算到局部视野中心的垂直距离进行重要性排序
-                dists = np.abs(np.dot(A_world_norm, c_world) - b_world_norm)
-                
-                valid_num = len(b_world_safe)
-                if valid_num > self.N_faces:
-                    idx = np.argsort(dists)[:self.N_faces]
-                    A_world_norm = A_world_norm[idx]
-                    b_world_safe = b_world_safe[idx]
-                    valid_num = self.N_faces
-                    
-                A_poly[:valid_num] = A_world_norm
-                b_poly[:valid_num] = b_world_safe
-                
-                # 不足 N_faces 用无效边界填满
-                if valid_num < self.N_faces:
-                    b_poly[valid_num:] = 1e5
-            else:
-                # 极速降级包络：防退化保护
-                A_poly[:4, :] = np.array([[1,0], [-1,0], [0,1], [0,-1]])
-                b_poly[0] = c_world[0] + 1.0
-                b_poly[1] = -(c_world[0] - 1.0)
-                b_poly[2] = c_world[1] + 1.0
-                b_poly[3] = -(c_world[1] - 1.0)
-                b_poly[4:] = 1e5
-                
-            per_item_batch_call_time = batch_call_time / max(1, batch_size)
+            center_world = np.array([
+                c_x_ints[k] * map_resolution,
+                c_y_ints[k] * map_resolution,
+            ], dtype=float)
+
+            t_unpack = time.time()
+            a_pix = a_batch[k] if k < len(a_batch) else None
+            b_pix = b_batch[k] if k < len(b_batch) else None
+            p_pixel = p_batch[k] if k < len(p_batch) else None
+            c_pixel = c_batch[k] if k < len(c_batch) else None
+            A_poly, b_poly, P_inv_world, c_world = _project_halfspaces_to_world(
+                a_pix, b_pix, p_pixel, c_pixel, center_world
+            )
+            python_postprocess_time = time.time() - t_unpack
             total_corridor_time = per_item_batch_call_time + python_postprocess_time
-            results.append((A_poly, b_poly, P_inv_world, c_world, per_item_batch_call_time, python_postprocess_time, total_corridor_time))
-            
+            results.append((
+                A_poly,
+                b_poly,
+                P_inv_world,
+                c_world,
+                per_item_batch_call_time,
+                python_postprocess_time,
+                total_corridor_time,
+            ))
+
         return results
-
-    # def _predict_ellipse_corridors_batched(self, occupancy_map, states_xy_list, map_resolution, max_bound=10.0):
-    #     # 批量神经网络推理
-    #     batch_size = len(states_xy_list)
-
-    #     patch_np_list = []
-    #     obs_points_list = []
-    #     c_x_ints = []
-    #     c_y_ints = []
-        
-    #     local_radius_m = 10.0
-    #     r_pixel_f = local_radius_m / map_resolution
-    #     r_pixel = int(np.round(r_pixel_f))
-    #     side_len = int(2 * r_pixel)
-        
-    #     h, w = occupancy_map.shape
-        
-    #     for state_xy in states_xy_list:
-    #         cx_f = state_xy[0] / map_resolution
-    #         cy_f = state_xy[1] / map_resolution
-    #         c_x_int = int(np.round(cx_f))
-    #         c_y_int = int(np.round(cy_f))
-    #         c_x_ints.append(c_x_int)
-    #         c_y_ints.append(c_y_int)
-            
-    #         raw_patch = np.zeros((side_len, side_len), dtype=np.uint8)
-            
-    #         x_min_map = c_x_int - r_pixel
-    #         x_max_map = c_x_int + r_pixel
-    #         y_min_map = c_y_int - r_pixel
-    #         y_max_map = c_y_int + r_pixel
-            
-    #         valid_x_min = max(0, x_min_map)
-    #         valid_x_max = min(w, x_max_map)
-    #         valid_y_min = max(0, y_min_map)
-    #         valid_y_max = min(h, y_max_map)
-            
-    #         p_x_min = valid_x_min - x_min_map
-    #         p_x_max = side_len - (x_max_map - valid_x_max)
-    #         p_y_min = valid_y_min - y_min_map
-    #         p_y_max = side_len - (y_max_map - valid_y_max)
-            
-    #         if valid_y_max > valid_y_min and valid_x_max > valid_x_min:
-    #             raw_patch[p_y_min:p_y_max, p_x_min:p_x_max] = occupancy_map[valid_y_min:valid_y_max, valid_x_min:valid_x_max]
-            
-    #         patch_np = cv2.resize(raw_patch, (self.patch_size, self.patch_size), interpolation=cv2.INTER_NEAREST).astype(np.float32)
-    #         patch_np_list.append(patch_np)
-            
-    #         obs_y, obs_x = np.where(patch_np >= 0.5)
-    #         if len(obs_x) > 0:
-    #             # 加入轻量降采样，步长为 2 可以在不损失包络精度的前提下直接砍掉 75% 的二次型测距计算量
-    #             obs_y = obs_y[::2]
-    #             obs_x = obs_x[::2]
-    #             obs_points_list.append(np.column_stack((obs_x, obs_y)).astype(float))
-    #         else:
-    #             obs_points_list.append(np.array([]))
-                
-    #     t_start_nn = time.time()
-        
-    #     batch_tensor = torch.from_numpy(np.array(patch_np_list)).float().unsqueeze(1).to(self.device)
-    #     with torch.no_grad():
-    #         pred_batch_tensor = self.iris_net(batch_tensor)
-            
-    #     t_end_nn = time.time()
-    #     nn_time = t_end_nn - t_start_nn
-        
-    #     mapped_resolution = (2.0 * local_radius_m) / self.patch_size
-    #     r_center = self.patch_size / 2.0
-        
-    #     results = []
-    #     for k in range(batch_size):
-    #         pred_tensor = pred_batch_tensor[k]
-    #         P_pixel, c_pixel = parse_network_output(pred_tensor, self.patch_size)
-            
-    #         physical_center_x = c_x_ints[k] * map_resolution
-    #         physical_center_y = c_y_ints[k] * map_resolution
-            
-    #         c_world = np.array([
-    #             (c_pixel[0] - r_center) * mapped_resolution + physical_center_x,
-    #             (c_pixel[1] - r_center) * mapped_resolution + physical_center_y
-    #         ])
-            
-    #         try:
-    #             P_inv_world = np.linalg.inv(P_pixel) * mapped_resolution
-    #         except np.linalg.LinAlgError:
-    #             P_inv_world = np.eye(2) * (r_pixel_f * map_resolution)
-                
-    #         t1 = time.time()
-    #         # 配合底层修改，这里直接接收不等式矩阵 A_pix 和 b_pix，不再计算顶点
-    #         A_pix, b_pix = generate_safe_polygon(P_pixel, c_pixel, obs_points_list[k], patch_size=self.patch_size)
-    #         poly_time = time.time() - t1
-            
-    #         A_poly = np.zeros((self.N_faces, 2))
-    #         b_poly = np.zeros(self.N_faces)
-            
-    #         if A_pix is not None and len(A_pix) > 0:
-    #             # --- O(1) 向量化坐标系仿射映射 ---
-    #             # 1. 转换 A_pix 到世界坐标系
-    #             A_world = A_pix / mapped_resolution
-                
-    #             # 过滤并归一化法向量
-    #             norms = np.linalg.norm(A_world, axis=1)
-    #             valid_mask = norms > 1e-5
-                
-    #             A_world = A_world[valid_mask]
-    #             b_pix = b_pix[valid_mask]
-    #             A_pix = A_pix[valid_mask]
-    #             norms = norms[valid_mask]
-                
-    #             A_world_norm = A_world / norms[:, None]
-                
-    #             # 2. 转换 b_pix 到世界坐标系
-    #             center_phys = np.array([physical_center_x, physical_center_y])
-    #             offset_pix = np.dot(A_pix, np.array([r_center, r_center]))
-    #             offset_phys = np.dot(A_world, center_phys)
-    #             b_world_raw = b_pix - offset_pix + offset_phys
-                
-    #             b_world_norm = b_world_raw / norms
-                
-    #             # 3. 引入车辆物理安全半径 (向内收缩)
-    #             b_world_safe = b_world_norm - self.r_safe
-                
-    #             # 4. 计算到局部视野中心的垂直距离进行重要性排序
-    #             dists = np.abs(np.dot(A_world_norm, c_world) - b_world_norm)
-                
-    #             valid_num = len(b_world_safe)
-    #             if valid_num > self.N_faces:
-    #                 idx = np.argsort(dists)[:self.N_faces]
-    #                 A_world_norm = A_world_norm[idx]
-    #                 b_world_safe = b_world_safe[idx]
-    #                 valid_num = self.N_faces
-                    
-    #             A_poly[:valid_num] = A_world_norm
-    #             b_poly[:valid_num] = b_world_safe
-                
-    #             # 不足 N_faces 用无效边界填满
-    #             if valid_num < self.N_faces:
-    #                 b_poly[valid_num:] = 1e5
-    #         else:
-    #             # 极速降级包络：防退化保护
-    #             A_poly[:4, :] = np.array([[1,0], [-1,0], [0,1], [0,-1]])
-    #             b_poly[0] = c_world[0] + 1.0
-    #             b_poly[1] = -(c_world[0] - 1.0)
-    #             b_poly[2] = c_world[1] + 1.0
-    #             b_poly[3] = -(c_world[1] - 1.0)
-    #             b_poly[4:] = 1e5
-                
-    #         results.append((A_poly, b_poly, P_inv_world, c_world, poly_time, nn_time / batch_size))
-            
-    #     return results
-
 
     def get_mpc_matrix_obstacle_force(self, state_vector: np.ndarray, obstacles: np.ndarray,
                                     step_index: int, H_scalar: float, R_influence=1.5) -> tuple:
@@ -1133,174 +442,6 @@ class Planner:
 
         return Q_obs, f_obs, cost_vec
 
-
-    # def get_mpc_matrix(self, predicted_states: np.ndarray, occupancy_map: np.ndarray, 
-    #                    guided_points: dict, 
-    #                    target_velocity: float,
-    #                    weight_lat_scale: float = 1.0, 
-    #                    weight_lon_scale: float = 1.0,
-    #                    weight_heading_scale: float = 1.0,
-    #                    weight_vel_scale: float = 1.0,
-    #                    weight_obs_scale: float = 1.0,
-    #                    weight_accel_scale: float = 1.0,
-    #                    weight_steer_scale: float = 1.0,
-    #                    weight_rate_steer_scale: float = 1.0,
-    #                    speed_reward_c_scale: float = 0.0,        
-    #                    weight_slack_scale: float = 1.0,          
-    #                    R_influence=1.5,
-    #                    map_resolution=1.0) -> dict:
-
-    #     mpc_stage_dict = {}
-    #     pos_refs = guided_points['posi']
-    #     angle_refs = guided_points['angle']
-    #     sum_nn_time = 0.0
-    #     sum_poly_time = 0.0
-    #     Q_lat = self.base_Q_lat * weight_lat_scale
-    #     Q_lon = self.base_Q_lon * weight_lon_scale
-    #     Q_heading = self.base_Q_heading * weight_heading_scale
-    #     Q_vel = self.base_Q_vel * weight_vel_scale
-        
-    #     R_accel = self.base_R_accel * weight_accel_scale
-    #     R_steer = self.base_R_steer * weight_steer_scale
-    #     R_rate_steer = self.base_R_rate_steer * weight_rate_steer_scale
-        
-    #     H_obs_scalar = self.base_weight_obs * weight_obs_scale
-    #     actual_speed_reward_c = self.base_speed_reward_c * speed_reward_c_scale
-        
-    #     # 提取松弛因子的 L1 和 L2 惩罚
-    #     actual_slack_weight = self.base_weight_slack * weight_slack_scale
-    #     Z_slack_sq = actual_slack_weight
-    #     z_slack_lin = actual_slack_weight / 10.0
-
-    #     # R(二次控制惩罚) 和 r(一次控制惩罚) 矩阵扩充包含所有松弛变量
-    #     current_R_rate = np.zeros((self.nu, self.nu))
-    #     current_R_rate[0, 0] = R_accel
-    #     current_R_rate[1, 1] = R_rate_steer
-    #     for i in range(self.nu_orig, self.nu):
-    #         current_R_rate[i, i] = Z_slack_sq
-            
-    #     current_r_rate = np.zeros((self.nu, 1))
-    #     for i in range(self.nu_orig, self.nu):
-    #         current_r_rate[i, 0] = z_slack_lin
-        
-    #     current_ego_state = predicted_states[:, 0]
-        
-    #     # =========================================================================
-    #     # >>> 单次构建全局 KDTree <<<
-    #     kdtree, local_obs = self._build_local_kdtree(occupancy_map, current_ego_state, map_resolution, radius=30.0)
-    #     # =========================================================================
-        
-    #     # >>> 单次利用 CorridorEllipseNet 批量生成预测几何多边形边界 <<<
-    #     states_xy_list = [(predicted_states[0, i], predicted_states[1, i]) for i in range(self.horizon_steps + 1)]
-    #     batched_results = self._predict_ellipse_corridors_batched(occupancy_map, states_xy_list, map_resolution)
-
-    #     for k in range(self.horizon_steps + 1):
-    #         raw_ref_heading = angle_refs[k]
-    #         ref_pos = pos_refs[k]
-            
-    #         # 使用真实物理预测状态，平滑旋转投影追踪偏差
-    #         current_theta = predicted_states[2, k]
-    #         ref_heading = raw_ref_heading + round((current_theta - raw_ref_heading) / (2 * math.pi)) * (2 * math.pi)
-
-    #         # 这里的 Frenet 投影是提供给【追踪参考路径的目标代价 J】使用的，因此必须用 ref_heading
-    #         cos_h = math.cos(ref_heading)
-    #         sin_h = math.sin(ref_heading)
-    #         M = np.array([
-    #             [-sin_h, cos_h, 0, 0], 
-    #             [ cos_h, sin_h, 0, 0], 
-    #             [     0,     0, 1, 0], 
-    #             [     0,     0, 0, 1]  
-    #         ])
-    #         Q_diag_transformed = np.diag([Q_lat, Q_lon, Q_heading, Q_vel])
-    #         Q_state = M.T @ Q_diag_transformed @ M
-
-    #         Qk = np.zeros((self.nx, self.nx))
-    #         Qk[:4, :4] = Q_state
-    #         Qk[4, 4] = R_steer
-
-    #         if k == self.horizon_steps:
-    #             Qk *= self.terminal_scale 
-
-    #         # 取用上一个控制周期的暖启动预期轨迹状态，它是物理上平滑过渡的
-    #         current_state = predicted_states[:, k]
-    #         smooth_x = current_state[0]
-    #         smooth_y = current_state[1]
-    #         smooth_theta = current_state[2]
-            
-    #         # --- 局部感知近邻提取 ---
-    #         if kdtree is not None:
-    #             # 严格围绕预测平滑点构建检索框
-    #             dists, idxs = kdtree.query((smooth_x, smooth_y), k=60, distance_upper_bound=10.0)
-    #             valid_mask = dists < 10.0
-    #             valid_idxs = idxs[valid_mask]
-    #             bubble_obs = local_obs[valid_idxs]
-    #         else:
-    #             bubble_obs = np.empty((0, 2))
-            
-    #         # 引入全新的预测点最近障碍排斥代价
-    #         Qk_obs, fk_obs, cost_vec = self.get_mpc_matrix_obstacle_force(
-    #             current_state.reshape(-1, 1), bubble_obs, k, H_scalar=H_obs_scalar, R_influence=R_influence
-    #         )
-
-    #         x_ref = np.array([ref_pos[0], ref_pos[1], ref_heading, target_velocity, 0.0])
-    #         fk = -Qk @ x_ref
-    #         fk[3] -= actual_speed_reward_c
-
-    #         # 加上的二次代价
-    #         Qk += Qk_obs
-    #         fk += fk_obs.flatten()
-
-    #         # 【包络线构造】利用批量生成的安全椭圆边界结果
-    #         A_poly, b_poly, P_inv, c_ell, poly_time, nn_time = batched_results[k]
-    #         sum_poly_time += poly_time
-    #         sum_nn_time += nn_time
-
-    #         stage = {
-    #             'Qk': Qk * self.cost_scaling, 
-    #             'fk': fk * self.cost_scaling,
-    #             'obstacles': bubble_obs, 
-    #             'obs_costs': cost_vec,
-    #             'A_poly': A_poly,
-    #             'b_poly': b_poly,
-    #             'P_inv': P_inv,
-    #             'c_ell': c_ell,
-    #             'smooth_pos': (smooth_x, smooth_y),
-    #             'smooth_heading': smooth_theta,
-    #             'ref_pos': ref_pos,
-    #             'ref_heading': ref_heading
-    #         }
-            
-    #         if k < self.horizon_steps:
-    #             stage['Rk'] = current_R_rate * self.cost_scaling
-    #             stage['rk'] = current_r_rate * self.cost_scaling
-                
-    #             # 建立多边形约束 C_mat (nx维作用于 x, y)
-    #             C_mat = np.zeros((self.N_faces, self.nx))
-    #             C_mat[:, 0:2] = A_poly
-                
-    #             # 建立控制依赖的松弛变量作用矩阵 D_mat
-    #             D_mat = np.zeros((self.N_faces, self.nu))
-    #             for i in range(self.N_faces):
-    #                 D_mat[i, self.nu_orig + i] = -1.0
-                
-    #             # 设定上下界：采用 D_mat 使得实际有效约束为 A_poly * x - s <= b_poly
-    #             lg = np.full((self.N_faces, 1), -1e5)
-    #             ug = b_poly.reshape(self.N_faces, 1)
-                
-    #             # 设定掩码屏蔽无穷边界
-    #             lg_mask = np.zeros((self.N_faces, 1))
-    #             ug_mask = np.ones((self.N_faces, 1))
-                
-    #             stage['C_mat'] = C_mat
-    #             stage['D_mat'] = D_mat
-    #             stage['lg'] = lg
-    #             stage['ug'] = ug
-    #             stage['lg_mask'] = lg_mask
-    #             stage['ug_mask'] = ug_mask
-            
-    #         mpc_stage_dict[k] = stage
-
-    #     return mpc_stage_dict, sum_poly_time, sum_nn_time
 
     def get_mpc_matrix(self, predicted_states: np.ndarray, occupancy_map: np.ndarray, 
                        guided_points: dict, 
@@ -1360,7 +501,7 @@ class Planner:
         
         # >>> 单次利用 C++ GPU 批量生成预测几何多边形边界 <<<
         states_xy_list = [(predicted_states[0, i], predicted_states[1, i]) for i in range(self.horizon_steps + 1)]
-        batched_results = self._predict_ellipse_corridors_batched(occupancy_map, states_xy_list, map_resolution)
+        batched_results = self._predict_safe_regions_batched(occupancy_map, states_xy_list, map_resolution)
 
         N_steps = self.horizon_steps + 1
         
@@ -1566,9 +707,6 @@ class Planner:
                 })
         info['mpc_corridors'] = mpc_corridors
 
-        if debug_render:
-            self._render_debug(current_state, X_opt, U_opt, mpc_stage_dict, pos_guided, phi_guided, target_velocity)
-
         next_state = self.model.sim_forward_step(current_state, next_ctrl_safe)
         X_next_guess, U_next_guess = self.horizon_forward_step(X_opt, U_opt, next_state)
         
@@ -1650,118 +788,3 @@ class Planner:
         new_u[:, :N - 1] = control_traj[:, 1:N]
         new_u[:, N - 1] = control_traj[:, N - 1]
         return new_x, new_u
-
-    def _render_debug(self, current_state, X_opt, U_opt, mpc_stage_dict, pos_guided, phi_guided, target_velocity):
-        import matplotlib.pyplot as plt
-        from matplotlib.patches import Polygon
-        
-        if not hasattr(self, 'debug_fig') or self.debug_fig is None or not plt.fignum_exists(self.debug_fig.number):
-            plt.ion()
-            self.debug_fig, self.debug_axs = plt.subplots(1, 2, figsize=(14, 5))
-            self.debug_fig.canvas.manager.set_window_title("Planner Internal Debug")
-
-        ax_map, ax_cost = self.debug_axs
-        ax_map.cla()
-        ax_cost.cla()
-
-        cx, cy, heading = current_state[0], current_state[1], current_state[2]
-        
-        ref_x = [p[0] for p in pos_guided]
-        ref_y = [p[1] for p in pos_guided]
-        ax_map.plot(ref_x, ref_y, 'g--', linewidth=1.5, label='Reference Path')
-
-        left_bounds_x, left_bounds_y = [], []
-        right_bounds_x, right_bounds_y = [], []
-        
-        for k in range(self.horizon_steps + 1):
-            if k in mpc_stage_dict and 'smooth_pos' in mpc_stage_dict[k]:
-                rp = mpc_stage_dict[k]['smooth_pos']
-                rh = mpc_stage_dict[k]['smooth_heading']
-                
-                # 绘制多边形边界的法线投影作为可视化提示
-                if 'A_poly' in mpc_stage_dict[k] and k % 5 == 0:
-                    import scipy.linalg
-                    A_poly = mpc_stage_dict[k]['A_poly']
-                    b_poly = mpc_stage_dict[k]['b_poly']
-                    if 'P_inv' in mpc_stage_dict[k]:
-                        P_inv = mpc_stage_dict[k]['P_inv']
-                        c_ell = mpc_stage_dict[k]['c_ell']
-                        
-                        # ==========================================
-                        # 1. 绘制提取的安全椭圆 (黄虚线)
-                        # ==========================================
-                        try:
-                            theta_vals = np.linspace(0, 2*np.pi, 50)
-                            ell_pts = np.vstack([np.cos(theta_vals), np.sin(theta_vals)])
-                            ell_world = c_ell[:, None] + P_inv @ ell_pts
-                            ax_map.plot(ell_world[0, :], ell_world[1, :], color='orange', alpha=0.5, linewidth=1.5, linestyle='--')
-                            ax_map.plot(c_ell[0], c_ell[1], 'x', color='orange', markersize=4)
-                        except Exception:
-                            pass
-                            
-                        # ==========================================
-                        # 2. 绘制包络多边形线段 (青色实线)
-                        # ==========================================
-                        for i in range(len(b_poly)):
-                            n_vec = A_poly[i]
-                            d = b_poly[i]
-                            # 估算切点位置
-                            radius = d + self.r_safe - np.dot(n_vec, c_ell)
-                            proj_pt = c_ell + n_vec * radius
-                            # 回退安全半径还原真实约束界限
-                            wall_center = proj_pt - n_vec * self.r_safe
-                            
-                            tangent_vec = np.array([-n_vec[1], n_vec[0]])
-                            # 获取更长一点的相交边线让它看起来像多边形
-                            length = radius * math.tan(math.pi / self.N_faces) * 1.5 if self.N_faces > 0 else 2.0
-                            p1 = wall_center + tangent_vec * length
-                            p2 = wall_center - tangent_vec * length
-                            
-                            ax_map.plot([p1[0], p2[0]], [p1[1], p2[1]], color='cyan', alpha=0.8, linewidth=1.5)
-                
-        if X_opt is not None and np.any(X_opt):
-            ax_map.plot(X_opt[0, :], X_opt[1, :], 'm-', linewidth=2.5, alpha=0.8, label='MPC Prediction')
-
-        local_obs = mpc_stage_dict[0].get('obstacles', np.empty((0, 2)))
-        obs_costs = mpc_stage_dict[0].get('obs_costs', np.empty((0, 1))).flatten()
-        
-        if len(local_obs) > 0:
-            sc = ax_map.scatter(local_obs[:, 0], local_obs[:, 1], c=obs_costs, cmap='autumn_r', 
-                                vmin=0, vmax=2.0, s=40, marker='x', label='Obstacles')
-
-        ax_map.plot(cx, cy, 'ko', markersize=8, label='Ego Vehicle')
-        ax_map.arrow(cx, cy, math.cos(heading)*3, math.sin(heading)*3, head_width=0.6, color='k')
-
-        ax_map.set_aspect('equal')
-        ax_map.set_xlim(cx - 15, cx + 15)
-        ax_map.set_ylim(cy - 15, cy + 15)
-        ax_map.set_title("Local View & Safe Corridor Boundaries")
-        ax_map.legend(loc='upper right', fontsize=8)
-        ax_map.grid(True, linestyle=':', alpha=0.6)
-
-        dx = cx - ref_x[0]
-        dy = cy - ref_y[0]
-        ref_h = phi_guided[0]
-        
-        lat_err = abs(-math.sin(ref_h) * dx + math.cos(ref_h) * dy)
-        lon_err = abs(math.cos(ref_h) * dx + math.sin(ref_h) * dy)
-        head_err = abs(heading - ref_h)
-        vel_err = abs(current_state[3] - target_velocity)
-        
-        max_obs_cost = np.max(obs_costs) if len(obs_costs) > 0 else 0.0
-        accel_cmd = abs(U_opt[0, 0]) if U_opt is not None else 0.0
-        steer_rate_cmd = abs(U_opt[1, 0]) if U_opt is not None else 0.0
-
-        labels = ['Lat Err', 'Lon Err', 'Head Err', 'Vel Err', 'Obs Dist', 'Accel Cmd', 'StrRate Cmd']
-        vals = [lat_err, lon_err, head_err, vel_err, max_obs_cost, accel_cmd, steer_rate_cmd]
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd', '#8c564b', '#e377c2']
-        
-        bars = ax_cost.bar(labels, vals, color=colors, alpha=0.85)
-        ax_cost.set_ylim(0, max(2.5, max(vals) * 1.2))
-        ax_cost.set_title("Current Tracking Errors & Control Efforts")
-        ax_cost.tick_params(axis='x', rotation=15, labelsize=9)
-        
-        for bar, val in zip(bars, vals):
-            ax_cost.text(bar.get_x() + bar.get_width()/2, val + 0.05, f'{val:.2f}', ha='center', va='bottom', fontsize=9)
-
-        plt.pause(0.001)

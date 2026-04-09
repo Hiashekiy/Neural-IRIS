@@ -1,4 +1,4 @@
-#include <array>
+﻿#include <array>
 #include <cstdint>
 #include <codecvt>
 #include <locale>
@@ -58,7 +58,7 @@ void parse_pred_to_geometry(const float* pred, int patch_size, Mat2& P, Point2& 
 
 extern "C" {
 
-__declspec(dllexport) int corridor_init(const char* model_path_utf8) {
+__declspec(dllexport) int neural_iris_init(const char* model_path_utf8) {
   try {
     std::lock_guard<std::mutex> lk(g_mu);
 
@@ -69,7 +69,7 @@ __declspec(dllexport) int corridor_init(const char* model_path_utf8) {
     opts.AppendExecutionProvider_CUDA(cuda_options);
   #endif
 
-    g_env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "corridor_cpp_bridge");
+    g_env = std::make_unique<Ort::Env>(ORT_LOGGING_LEVEL_WARNING, "neural_iris_cpp_bridge");
 
 #ifdef _WIN32
     std::wstring model_path_w = utf8_to_wstring(std::string(model_path_utf8));
@@ -92,7 +92,7 @@ __declspec(dllexport) int corridor_init(const char* model_path_utf8) {
   }
 }
 
-__declspec(dllexport) int corridor_infer(
+__declspec(dllexport) int neural_iris_infer_safe_region(
     const uint8_t* mask_ptr,
     int patch_size,
     double safety_margin,
@@ -157,7 +157,7 @@ __declspec(dllexport) int corridor_infer(
   }
 }
 
-__declspec(dllexport) int corridor_infer_batch(
+__declspec(dllexport) int neural_iris_infer_safe_region_batch(
     const uint8_t* masks_ptr,
     int batch_size,
     int patch_size,
@@ -240,7 +240,7 @@ __declspec(dllexport) int corridor_infer_batch(
   }
 }
 
-__declspec(dllexport) int corridor_infer_batch_with_ellipse(
+__declspec(dllexport) int neural_iris_infer_safe_region_batch_with_ellipse(
     const uint8_t* masks_ptr,
     int batch_size,
     int patch_size,
@@ -335,7 +335,99 @@ __declspec(dllexport) int corridor_infer_batch_with_ellipse(
   }
 }
 
-__declspec(dllexport) void corridor_shutdown() {
+__declspec(dllexport) int neural_iris_infer_safe_region_batch_halfspaces(
+    const uint8_t* masks_ptr,
+    int batch_size,
+    int patch_size,
+    double safety_margin,
+    double* out_a_rows,
+    double* out_b_vals,
+    int max_halfspaces,
+    int* out_halfspace_counts,
+    double* out_p_mats,
+    double* out_centers) {
+  try {
+    if (!g_sess || !masks_ptr || !out_a_rows || !out_b_vals || !out_halfspace_counts || !out_p_mats || !out_centers ||
+        batch_size <= 0 || patch_size <= 0 || max_halfspaces <= 0) {
+      return 2;
+    }
+
+    std::lock_guard<std::mutex> lk(g_mu);
+
+    const size_t one_n = static_cast<size_t>(patch_size * patch_size);
+    const size_t all_n = static_cast<size_t>(batch_size) * one_n;
+
+    std::vector<float> input(all_n, 0.0f);
+    for (size_t i = 0; i < all_n; ++i) {
+      input[i] = masks_ptr[i] ? 1.0f : 0.0f;
+    }
+
+    std::array<int64_t, 4> input_shape = {batch_size, 1, patch_size, patch_size};
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        mem_info,
+        input.data(),
+        input.size(),
+        input_shape.data(),
+        input_shape.size());
+
+    const char* in_name = g_input_name.c_str();
+    const char* out_name = g_output_name.c_str();
+    auto output_tensors = g_sess->Run(Ort::RunOptions{nullptr}, &in_name, &input_tensor, 1, &out_name, 1);
+
+    float* pred = output_tensors[0].GetTensorMutableData<float>();
+
+    for (int bi = 0; bi < batch_size; ++bi) {
+      out_halfspace_counts[bi] = 0;
+      const float* pred_i = pred + static_cast<size_t>(bi) * 6;
+
+      Mat2 P{};
+      Point2 c{};
+      parse_pred_to_geometry(pred_i, patch_size, P, c);
+
+      const size_t p_off = static_cast<size_t>(bi) * 4;
+      out_p_mats[p_off + 0] = P[0][0];
+      out_p_mats[p_off + 1] = P[0][1];
+      out_p_mats[p_off + 2] = P[1][0];
+      out_p_mats[p_off + 3] = P[1][1];
+
+      const size_t c_off = static_cast<size_t>(bi) * 2;
+      out_centers[c_off + 0] = c.x;
+      out_centers[c_off + 1] = c.y;
+
+      const uint8_t* mask_i_ptr = masks_ptr + static_cast<size_t>(bi) * one_n;
+      std::vector<uint8_t> obs_mask(one_n, 0);
+      for (size_t k = 0; k < one_n; ++k) {
+        obs_mask[k] = mask_i_ptr[k] ? 1 : 0;
+      }
+
+      std::vector<Point2> obs_points = extract_obstacle_boundary(obs_mask, patch_size, patch_size);
+      std::vector<Vec2> A;
+      std::vector<double> b;
+      build_safe_halfspaces(P, c, obs_points, patch_size, safety_margin, A, b);
+
+      const int write_n = static_cast<int>(std::min<size_t>(A.size(), static_cast<size_t>(max_halfspaces)));
+      out_halfspace_counts[bi] = write_n;
+
+      const size_t a_off = static_cast<size_t>(bi) * static_cast<size_t>(max_halfspaces) * 2;
+      const size_t b_off = static_cast<size_t>(bi) * static_cast<size_t>(max_halfspaces);
+      for (int hi = 0; hi < write_n; ++hi) {
+        out_a_rows[a_off + static_cast<size_t>(2 * hi + 0)] = A[static_cast<size_t>(hi)][0];
+        out_a_rows[a_off + static_cast<size_t>(2 * hi + 1)] = A[static_cast<size_t>(hi)][1];
+        out_b_vals[b_off + static_cast<size_t>(hi)] = b[static_cast<size_t>(hi)];
+      }
+    }
+
+    return 0;
+  } catch (...) {
+    for (int bi = 0; bi < batch_size; ++bi) {
+      out_halfspace_counts[bi] = 0;
+    }
+    return 3;
+  }
+}
+
+__declspec(dllexport) void neural_iris_shutdown() {
   std::lock_guard<std::mutex> lk(g_mu);
   g_sess.reset();
   g_env.reset();
@@ -344,3 +436,5 @@ __declspec(dllexport) void corridor_shutdown() {
 }
 
 }
+
+

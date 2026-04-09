@@ -1,4 +1,4 @@
-#include <array>
+﻿#include <array>
 #include <chrono>
 #include <exception>
 #include <fstream>
@@ -112,13 +112,13 @@ int get_arg_int(int argc, char** argv, const std::string& key, int fallback) {
 
 int main(int argc, char** argv) {
   try {
-  const std::string onnx_path = get_arg(argc, argv, "--onnx", "models/corridor_ellipse_net.onnx");
+  const std::string onnx_path = get_arg(argc, argv, "--onnx", "models/neural_iris_net.onnx");
   const std::string mask_path = get_arg(argc, argv, "--mask", "");
   const int patch_size = get_arg_int(argc, argv, "--patch", 128);
   const double safety_margin = get_arg_double(argc, argv, "--safety", 0.5);
 
   if (mask_path.empty()) {
-    std::cerr << "Usage: corridor_cpp_infer --onnx <model.onnx> --mask <mask.txt> [--patch 128] [--safety 0.5]" << std::endl;
+    std::cerr << "Usage: neural_iris_cpp_infer --onnx <model.onnx> --mask <mask.txt> [--patch 128] [--safety 0.5]" << std::endl;
     return 1;
   }
 
@@ -138,7 +138,7 @@ int main(int argc, char** argv) {
 
   auto t0 = std::chrono::high_resolution_clock::now();
 
-  Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "corridor_cpp");
+  Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "neural_iris_cpp");
   Ort::SessionOptions session_opts;
   session_opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 
@@ -230,3 +230,5 @@ int main(int argc, char** argv) {
     return 4;
   }
 }
+
+

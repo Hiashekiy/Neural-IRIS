@@ -54,8 +54,9 @@ def simulate_guided_motion(current_s, path_points, cumulative_dists, velocity, s
     return positions, angles
 
 class MPCEnv:
-    def __init__(self, map_obstacle, max_steps=1000, input_resolution=1.0, path_mode="train"):
+    def __init__(self, map_obstacle, max_steps=1000, input_resolution=1.0, path_mode="train", planner_mode="constrained"):
         self.path_mode = path_mode
+        self.planner_mode = planner_mode
         self.lidar_path_shortcut = None
         self.input_resolution = float(input_resolution)
         self.max_steps = max_steps
@@ -114,7 +115,12 @@ class MPCEnv:
         
         self.veh_circle_radius = np.hypot(self.veh_wheelbase / 2, self.veh_width / 2)
 
-        from src.planner.planner import Planner
+        if planner_mode == "constrained":
+            from src.planner.planner import Planner
+        elif planner_mode == "unconstrained":
+            from src.planner.planner_unconstrained import Planner
+        else:
+            raise ValueError(f"Unsupported planner_mode: {planner_mode}")
         self.planner = Planner(sample_time=self.dt, horizon_steps=20, veh_wheelbase=self.veh_wheelbase)
         self.planner.set_bounds(
             pos_ub=np.array([self.map_width_m, self.map_height_m]),

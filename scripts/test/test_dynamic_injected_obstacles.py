@@ -328,24 +328,9 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
         }
 
     last_obs_step = 0
-    moving_obstacles = []
-    clean_map = base_env.map_obstacle.copy()
-
     while not done:
-        # Dynamic injection & moving updates
+        # Dynamic injection
         if getattr(base_env, 'use_obstacles', False) and base_env.poly_points_np is not None:
-            # 1. Update positions of existing moving obstacles
-            dt = 0.1  # Assume 0.1s step time for moving obstacles
-            alive_obstacles = []
-            for m_obs in moving_obstacles:
-                m_obs['pos'][0] += m_obs['vel'][0] * dt
-                m_obs['pos'][1] += m_obs['vel'][1] * dt
-                # Keep obstacle if it's still somewhat near the car (e.g. within 50m)
-                if np.linalg.norm(m_obs['pos'] - base_env.state[:2]) < 50.0:
-                    alive_obstacles.append(m_obs)
-            moving_obstacles = alive_obstacles
-
-            # 2. Spawn new moving obstacles
             if step - last_obs_step >= 25:
                 cx_m, cy_m = base_env.state[0], base_env.state[1]
                 path_pts = base_env.poly_points_np
@@ -363,36 +348,15 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
                         
                 if target_idx > closest_idx + 5 and target_idx < len(path_pts) - 5:
                     target_pt = path_pts[target_idx]
-                    
-                    # Random velocity for the obstacle (speed 1 to 2.5 m/s)
-                    angle = np.random.uniform(0, 2 * np.pi)
-                    speed = np.random.uniform(1.0, 2.5)
-                    vx, vy = speed * np.cos(angle), speed * np.sin(angle)
-                    
+                    res = base_env.INTERNAL_RESOLUTION
+                    h, w = base_env.map_obstacle.shape
+                    tx_px, ty_px = int(target_pt[0]/res), int(target_pt[1]/res)
                     r_px = np.random.randint(4, 9)
-                    
-                    moving_obstacles.append({
-                        'pos': np.array([target_pt[0], target_pt[1]], dtype=np.float32),
-                        'vel': np.array([vx, vy], dtype=np.float32),
-                        'r_px': r_px
-                    })
-                    print(f"[Moving Obs] 注入新移动障碍物！距离 {lookahead_m:.1f} m，速度 {speed:.2f} m/s")
-                    last_obs_step = step
-
-            # 3. Redraw map
-            base_env.map_obstacle[:] = clean_map[:]
-            h, w = base_env.map_obstacle.shape
-            res = base_env.INTERNAL_RESOLUTION
-            for m_obs in moving_obstacles:
-                tx_px, ty_px = int(m_obs['pos'][0] / res), int(m_obs['pos'][1] / res)
-                r_px = m_obs['r_px']
-                y_grid, x_grid = np.ogrid[-ty_px:h-ty_px, -tx_px:w-tx_px]
-                mask = x_grid*x_grid + y_grid*y_grid <= r_px*r_px
-                # Avoid out of bounds issues if mask goes outside
-                try:
+                    y_grid, x_grid = np.ogrid[-ty_px:h-ty_px, -tx_px:w-tx_px]
+                    mask = x_grid*x_grid + y_grid*y_grid <= r_px*r_px
                     base_env.map_obstacle[mask] = 1
-                except Exception:
-                    pass  # out of bounds, skip rendering it
+                    print(f"[Dynamic Obs] 注入新障碍物！距离 {lookahead_m:.1f} m")
+                    last_obs_step = step
 
         terminated, truncated, infos = env.step(fixed_action)
         done = terminated or truncated
@@ -475,7 +439,7 @@ def main():
     parser.add_argument('--episodes', type=int, default=5, help='运行 episode 数量')
     parser.add_argument('--no-render', action='store_true', help='关闭实时展示')
     parser.add_argument('--density', type=float, default=1, help='障碍物采样密度 [0,1]，默认 0.5')
-    parser.add_argument('--v-ref', type=float, default=10.0, help='指定基线测试的目标车速 v_ref')
+    parser.add_argument('--v-ref', type=float, default=8.0, help='指定基线测试的目标车速 v_ref')
     parser.add_argument('--w-obs', type=float, default=10.0, help='避障权重乘子')
     parser.add_argument('--r-inf', type=float, default=1.0, help='障碍影响半径 R_influence')
     parser.add_argument('--w-lat', type=float, default=4.0, help='横向跟踪权重乘子')
