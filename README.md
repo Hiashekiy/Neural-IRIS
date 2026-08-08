@@ -264,12 +264,10 @@ A, b, P, c = infer_safe_region_halfspaces(obs_mask)
 
 ## MPC 闭环规划实验（可选）
 
-三个实验脚本位于 `scripts/test/mpc/`，用于验证 Neural-IRIS 生成的凸区域作为 MPC 线性安全约束的效果：
+实验脚本位于 `scripts/test/mpc/`，用于验证 Neural-IRIS 生成的凸区域作为 MPC 线性安全约束的效果。该实验在仿真过程中每隔一段时间在车辆前方路径上**在线注入新的静态障碍物**，检验 MPC 能否结合实时占据地图与 Neural-IRIS 半空间约束完成避障：
 
 ```bash
-python scripts/test/mpc/test_moving_obstacles.py --map random --episodes 5 --no-render --backend python
-python scripts/test/mpc/test_statically_injected_obstacles.py --map random --episodes 5 --no-render --backend python
-python scripts/test/mpc/test_dynamic_injected_obstacles.py --map random --episodes 5 --no-render --backend python
+python scripts/test/mpc/test_dynamic_obstacles.py --map random --episodes 5 --no-render --backend python
 ```
 
 - `--map random` 从 `data/street-map/val/` 随机选择地图，也可传入具体 `.map` 文件名；
