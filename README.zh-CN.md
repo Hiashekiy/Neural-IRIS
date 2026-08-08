@@ -309,4 +309,4 @@ python scripts/demo/mpc-neural-iris.py --map random --episodes 5 --no-render --b
 
 ## License
 
-（待补充 —— 仓库公开前请选择一个开源许可证，例如 MIT 或 Apache-2.0。）
+本项目基于 [MIT License](LICENSE) 开源。

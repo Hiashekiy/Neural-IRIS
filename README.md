@@ -309,4 +309,4 @@ If this work is helpful to your research, please cite:
 
 ## License
 
-(To be added — choose an open-source license such as MIT or Apache-2.0 before making the repository public.)
+This project is released under the [MIT License](LICENSE).
