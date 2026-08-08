@@ -59,7 +59,7 @@ pip install -r requirements.txt
 其中 `torch` / `torchvision` 会从默认 PyPI 安装 CPU 版本。需要 CUDA 训练时，请按 [PyTorch 官网](https://pytorch.org/get-started/locally/) 给出的命令安装对应 CUDA 版本的 torch，例如：
 
 ```bash
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 ```
 
 可选依赖：
@@ -73,9 +73,27 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 ## 数据准备
 
-训练/推理需要两类数据：原始街道地图（Moving AI `.map` 格式）和处理好的 NPZ 数据集。
+训练和演示需要的数据有两种获取方式（二选一）：直接下载作者处理好的 NPZ 数据集，或者下载原始地图后用预处理脚本自己生成。
 
-### 1. 原始地图（Moving AI）
+### 方式 A：直接下载处理好的数据集（推荐）
+
+作者发布的数据集（`train_iris.npz` / `val_iris.npz` / `test_iris.npz`，与论文实验一致）可从 GitHub Releases 下载：
+
+```bash
+python scripts/download_assets.py --dataset
+```
+
+解压后得到：
+
+```text
+data/iris-dataset/splits/train_iris.npz   # 95,883 样本
+data/iris-dataset/splits/val_iris.npz     # 11,985 样本
+data/iris-dataset/splits/test_iris.npz    # 11,986 样本
+```
+
+### 方式 B：下载原始地图，用预处理脚本自己生成
+
+#### B1. 下载原始地图（Moving AI）
 
 本项目使用 [Moving AI Lab 2D Pathfinding Benchmarks - Street](https://movingai.com/benchmarks/street/index.html) 的地图（Berlin、Boston、London、Paris、Shanghai 等城市）。下载后把 `.map` 文件分别放到：
 
@@ -84,16 +102,24 @@ data/street-map/train/
 data/street-map/val/
 ```
 
-### 2. 生成训练数据
+点击数据集页面中的 **Download all maps**，或直接下载 [street-map.zip](https://movingai.com/benchmarks/street/street-map.zip)。训练和演示使用的测试地图是同一基准中不相交的文件。
+
+#### B2. 撒点、裁剪、生成训练标签
 
 ```bash
-# 从地图中采样局部 patch，并用离线 IRIS 求解器生成椭圆标签
+# 撒点：density=0.02，在自由空间随机采样约 2% 的栅格作为锚点
+# 裁剪：以每个锚点为中心裁剪 128×128 的局部占据地图
+# 生成标签：对每个局部地图运行离线 IRIS 求解器，得到椭圆参数作为监督标签
 python src/dataset/generate_dataset.py \
     --map-dir data/street-map \
     --output data/iris-dataset/full_iris_dataset.npz \
     --density 0.02 --patch-size 128 --batch-size 200 --seed 42
+```
 
-# 过滤掉中心点不在椭圆内的样本
+#### B3. 过滤与划分
+
+```bash
+# 过滤：剔除中心锚点不在椭圆内的样本，保证标签几何有效
 python src/dataset/filter_dataset.py \
     --input data/iris-dataset/full_iris_dataset.npz \
     --output data/iris-dataset/filtered_iris_dataset.npz
@@ -104,15 +130,13 @@ python src/dataset/split_dataset.py \
     --out-dir data/iris-dataset/splits
 ```
 
-最终得到：
+两种方式最终都得到同一组文件：
 
 ```text
 data/iris-dataset/splits/train_iris.npz   # 95,883 样本
 data/iris-dataset/splits/val_iris.npz     # 11,985 样本
 data/iris-dataset/splits/test_iris.npz    # 11,986 样本
 ```
-
-> 也可以直接使用作者发布的数据集/权重（发布后执行 `python scripts/download_assets.py --dataset`），跳过 1–2 步。
 
 ## 模型权重
 
@@ -122,6 +146,8 @@ data/iris-dataset/splits/test_iris.npz    # 11,986 样本
 2. 自行训练生成（见下一节）。
 
 C++ 后端还需要 ONNX 模型 `cpp/models/neural_iris_net.onnx`，可自行导出（`python scripts/download_assets.py --onnx` 或见“C++ 推理”）。
+
+不想训练的话，下载权重后直接跳到「效果展示与推理」运行演示即可。
 
 ## 训练
 
@@ -160,7 +186,9 @@ python scripts/train/final_evaluate_neural_iris.py \
 python scripts/train/plot_final_test_metrics.py logs/neural_iris_eval/final_test
 ```
 
-## 推理
+## 效果展示与推理
+
+本节演示训练好的模型如何生成无障碍凸区域。不想自己训练的用户，下载权重（`python scripts/download_assets.py`）和测试数据（方式 A）后即可直接运行。
 
 ### 命令行演示
 
