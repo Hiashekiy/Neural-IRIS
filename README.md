@@ -2,7 +2,7 @@
 
 **English** | [中文](README.zh-CN.md)
 
-**面向局部轨迹规划的快速无障碍凸区域生成方法** (Fast Obstacle-Free Convex Region Generation for Local Trajectory Planning)
+Fast Obstacle-Free Convex Region Generation for Local Trajectory Planning
 
 Neural-IRIS takes a 128×128 local occupancy map, predicts a prior ellipse with a convolutional neural network, and then analytically constructs separating hyperplanes from the quadratic form of the ellipse, producing a collision-free convex region
 $\mathcal{P}=\{x\in\mathbb{R}^2 \mid Ax\le b\}$
