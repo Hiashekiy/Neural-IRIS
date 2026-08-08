@@ -5,9 +5,9 @@ Stage 2 MPC 纯基线(Baseline) 测试
 包含 MPC 预测轨迹可视化与 CBF 介入状态监控。
 
 用法:
-    python scripts/test/test_default_mpc.py
-    python scripts/test/test_default_mpc.py --map map1.png --episodes 5 --v-ref 4.0
-    python scripts/test/test_default_mpc.py --no-render
+    python scripts/demo/mpc-neural-iris.py
+    python scripts/demo/mpc-neural-iris.py --map map1.png --episodes 5 --v-ref 4.0
+    python scripts/demo/mpc-neural-iris.py --no-render
 """
 import os
 import sys
@@ -26,7 +26,7 @@ from matplotlib.patches import Polygon
 
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '..', '..', '..'))
+project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 

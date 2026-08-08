@@ -15,7 +15,7 @@ Neural-IRIS 从局部占据地图（128×128）出发，先用卷积神经网络
 ```mermaid
 flowchart LR
     T[Python 训练<br/>scripts/train/train_neural_iris.py] --> W[权重文件<br/>models/neural_iris_net_best.pth]
-    W --> P[Python 推理<br/>src/neural_iris + scripts/test]
+    W --> P[Python 推理<br/>src/neural_iris + scripts/demo]
     W --> E[导出 ONNX<br/>cpp/export_neural_iris_onnx.py]
     E --> C[C++ 推理<br/>cpp 目录 + ONNX Runtime]
 ```
@@ -35,8 +35,8 @@ Neural-IRIS/
 │   ├── neural_iris/        # 模型、几何处理、推理运行时（核心）
 │   └── planner/            # MPC 规划器（hpipm / osqp）、车辆模型、BFS 路径
 ├── scripts/
-│   ├── train/              # 训练、最终评估、指标绘图
-│   └── test/               # 推理演示；mpc/ 目录为闭环规划实验
+│   ├── train/              # 训练、评估、指标绘图
+│   └── demo/               # 效果演示（推理可视化、MPC 闭环规划）
 ├── cpp/                    # C++ ONNX Runtime 推理 + Python bridge（可选）
 ├── data/                   # 数据集（git 忽略，见“数据准备”）
 ├── models/                 # 模型权重（git 忽略，需单独下载/训练生成）
@@ -193,7 +193,7 @@ python scripts/train/plot_final_test_metrics.py logs/neural_iris_eval/final_test
 ### 命令行演示
 
 ```bash
-python scripts/test/neural_iris_inference.py --backend python --mode headless --num 5
+python scripts/demo/neural_iris_inference.py --backend python --mode headless --num 5
 ```
 
 - `--backend`：`python`（默认）或 `cpp`（需先构建 C++ bridge）；
@@ -264,10 +264,10 @@ A, b, P, c = infer_safe_region_halfspaces(obs_mask)
 
 ## MPC 闭环规划实验（可选）
 
-实验脚本位于 `scripts/test/mpc/`，用于验证 Neural-IRIS 生成的凸区域作为 MPC 线性安全约束的效果。该实验在仿真过程中每隔一段时间在车辆前方路径上**在线注入新的静态障碍物**，检验 MPC 能否结合实时占据地图与 Neural-IRIS 半空间约束完成避障：
+实验脚本位于 `scripts/demo/`，用于验证 Neural-IRIS 生成的凸区域作为 MPC 线性安全约束的效果。该实验在仿真过程中每隔一段时间在车辆前方路径上**在线注入新的静态障碍物**，检验 MPC 能否结合实时占据地图与 Neural-IRIS 半空间约束完成避障：
 
 ```bash
-python scripts/test/mpc/mpc-neural-iris.py --map random --episodes 5 --no-render --backend python
+python scripts/demo/mpc-neural-iris.py --map random --episodes 5 --no-render --backend python
 ```
 
 - `--map random` 从 `data/street-map/val/` 随机选择地图，也可传入具体 `.map` 文件名；
