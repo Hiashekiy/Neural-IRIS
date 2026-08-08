@@ -22,7 +22,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 
 # TODO: 创建 GitHub Release 后，把占位地址替换为真实地址，例如：
 #   https://github.com/<用户名>/<仓库名>/releases/download/v1.0.0
-RELEASE_BASE = "https://github.com/<YOUR_USER>/<YOUR_REPO>/releases/download/v1.0.0"
+RELEASE_BASE = "https://github.com/Hiashekiy/Neural-IRIS/releases/download/v1.0.0"
 
 ASSETS = {
     "weights": {
