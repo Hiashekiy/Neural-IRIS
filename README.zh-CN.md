@@ -270,9 +270,9 @@ A, b, P, c = infer_safe_region_halfspaces(obs_mask)
 
 MPC 闭环实验效果演示：
 
-<video src="assets/mpc-neural-iris.mp4" controls="controls" muted="muted" style="max-width: 100%;"></video>
+![MPC 闭环演示](assets/mpc-neural-iris.gif)
 
-> 如果此处无法播放，可下载 [mpc-neural-iris.mp4](assets/mpc-neural-iris.mp4)。
+> 可播放的 H.264 视频（含声音）：[mpc-neural-iris.mp4](assets/mpc-neural-iris.mp4)
 
 ```bash
 python scripts/demo/mpc-neural-iris.py --map random --episodes 5 --no-render --backend python
