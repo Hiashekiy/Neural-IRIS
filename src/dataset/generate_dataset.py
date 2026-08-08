@@ -30,16 +30,27 @@ if CVXOPT_AVAILABLE:
     solvers.options['show_progress'] = False
 
 def load_moving_ai_map(filepath):
-    """解析 Moving AI .map 文件"""
+    """解析 Moving AI .map 文件（兼容带 resolution/cell_length_m 等扩展头部的自定义格式）"""
     with open(filepath, 'r') as f:
         lines = f.readlines()
     
-    height = int(lines[1].split()[1])
-    width = int(lines[2].split()[1])
+    height = 0
+    width = 0
+    map_start = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s.startswith('height'):
+            height = int(s.split()[1])
+        elif s.startswith('width'):
+            width = int(s.split()[1])
+        elif s.startswith('map'):
+            map_start = i + 1
+            break
+
     grid = np.zeros((height, width), dtype=np.uint8)
     
-    for i, line in enumerate(lines[4:]):
-        for j, char in enumerate(line.strip()):
+    for i in range(height):
+        for j, char in enumerate(lines[map_start + i].strip()):
             if char in ['@', 'O', 'T', 'W']:
                 grid[i, j] = 1  # 障碍物
     return grid
@@ -350,8 +361,11 @@ def generate_dataset(map_dir, output_file, density=0.02, patch_size=128, batch_s
     if rng_seed is not None:
         np.random.seed(rng_seed)
 
-    map_files = glob.glob(os.path.join(map_dir, "*.map"))
-    map_files = sorted(map_files)
+    # 支持地图直接放在 map_dir 下，或放在 train/、val/ 等子目录中
+    map_files = glob.glob(os.path.join(map_dir, "*.map")) + glob.glob(
+        os.path.join(map_dir, "**", "*.map"), recursive=True
+    )
+    map_files = sorted(set(map_files))
     if max_maps is not None:
         map_files = map_files[:max_maps]
     all_patches = []
