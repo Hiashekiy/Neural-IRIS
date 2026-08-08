@@ -1,12 +1,14 @@
-# Neural-IRIS minimal Python dependencies
+# Neural-IRIS Python dependencies
 #
-# Notes:
-# - `torch` / `torchvision` can be installed from the official PyTorch index
-#   if you need a CUDA-enabled build.
-# - `hpipm_python` is used by the MPC planner path, but it is not listed here
-#   because it is typically built/installed separately rather than pulled from PyPI.
-# - If you only need training / evaluation / plotting, you do not need `hpipm_python`.
-
+# 作者实测环境（conda env: GGMPC, Python 3.10.19, CUDA 12.6）：
+#   torch 2.9.1+cu126 | torchvision 0.24.1+cu126 | numpy 2.2.6 | scipy 1.15.3
+#   matplotlib 3.10.7 | tqdm 4.67.3 | opencv-python 4.13.0.90
+#   cvxpy 1.7.5 | osqp 1.1.0 | onnx 1.21.0 | hpipm-python 0.2
+#
+# CUDA 版 PyTorch 请从官方 index 安装，例如：
+#   pip install torch==2.9.1 torchvision==0.24.1 --index-url https://download.pytorch.org/whl/cu126
+#
+# 仅训练 / 评估 / 绘图时，以下依赖即可：
 numpy>=1.24
 scipy>=1.10
 matplotlib>=3.7
@@ -17,6 +19,7 @@ torchvision>=0.19
 cvxpy>=1.4
 osqp>=0.6
 
-# Optional: only needed for exporting the ONNX model used by the C++ backend
-# (cpp/export_neural_iris_onnx.py):
-# onnx>=1.16
+# 可选依赖（按需安装）：
+# onnx>=1.16        # 仅导出 ONNX 模型（cpp/export_neural_iris_onnx.py，C++ 部署）时需要
+# hpipm-python==0.2 # 仅 MPC 规划器（src/planner/planner.py，hpipm 求解器）需要；
+#                   # 不在 PyPI 上，需从源码构建（作者环境已安装）

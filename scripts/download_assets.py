@@ -83,6 +83,14 @@ def main():
             os.makedirs(asset["path"], exist_ok=True)
             with zipfile.ZipFile(zip_path) as zf:
                 zf.extractall(asset["path"])
+            # 兼容 zip 内带顶层目录的情况：把散落的 npz 统一提升到目标目录
+            for root, _, files in os.walk(asset["path"]):
+                for fn in files:
+                    if fn.endswith(".npz"):
+                        src = os.path.join(root, fn)
+                        dst = os.path.join(asset["path"], fn)
+                        if os.path.abspath(src) != os.path.abspath(dst):
+                            os.replace(src, dst)
             print(f"Extracted dataset to {os.path.relpath(asset['path'], ROOT)}")
             os.remove(zip_path)
         else:
