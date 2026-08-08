@@ -26,7 +26,7 @@ from matplotlib.patches import Polygon
 
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
+project_root = os.path.abspath(os.path.join(current_dir, '..', '..',  '..'))
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 
@@ -150,10 +150,6 @@ def render_step(render_objs, base_env, action_physical, traj_x, traj_y, velociti
     render_objs['wheel_rl'].set_xy(get_wheel(0, w_y, 0.0))
     render_objs['wheel_rr'].set_xy(get_wheel(0, -w_y, 0.0))
 
-
-    if 'map_img' in render_objs:
-        render_objs['map_img'].set_data(1 - base_env.map_obstacle)
-        
     al = 4.0 / res
     render_objs['car_arrow'].xy = (cx + al * np.cos(heading), cy + al * np.sin(heading))
     render_objs['car_arrow'].set_position((cx, cy))
@@ -215,9 +211,14 @@ def render_step(render_objs, base_env, action_physical, traj_x, traj_y, velociti
                     if c_ell is not None and P_inv is not None:
                         theta_vals = np.linspace(0, 2*np.pi, 30)
                         ell_pts = np.vstack([np.cos(theta_vals), np.sin(theta_vals)])
-                        ell_world = c_ell[:, None] + P_inv @ ell_pts
-                        ell_patches[k].set_data(ell_world[0, :] / res, ell_world[1, :] / res)
-                        ell_patches[k].set_visible(True)
+                        # P_inv 直接把单位圆映射到椭圆边界（不需要再开方）。
+                        P_inv = np.asarray(P_inv, dtype=float)
+                        if P_inv.shape == (2, 2):
+                            ell_world = c_ell[:, None] + P_inv @ ell_pts
+                            ell_patches[k].set_data(ell_world[0, :] / res, ell_world[1, :] / res)
+                            ell_patches[k].set_visible(True)
+                        else:
+                            ell_patches[k].set_visible(False)
                     else:
                         ell_patches[k].set_visible(False)
                 except Exception:
@@ -246,6 +247,21 @@ def render_step(render_objs, base_env, action_physical, traj_x, traj_y, velociti
 def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: int, save_video: bool = False):
     info = env.reset()
 
+    if getattr(base_env, 'use_obstacles', False) and base_env.poly_points_np is not None:
+        path_pts = base_env.poly_points_np
+        res = base_env.INTERNAL_RESOLUTION
+        h, w = base_env.map_obstacle.shape
+        num_obs = int(len(path_pts) * base_env.obs_density / 20)
+        num_obs = max(1, num_obs)
+        for _ in range(num_obs):
+            idx = np.random.randint(len(path_pts) // 5, len(path_pts) * 4 // 5)
+            cx, cy = int(path_pts[idx][0] / res), int(path_pts[idx][1] / res)
+            r = np.random.randint(2, 6)
+            y, x = np.ogrid[-cy:h-cy, -cx:w-cx]
+            mask = x*x + y*y <= r*r
+            base_env.map_obstacle[mask] = 1
+        print(f'[Obstacles] 已在轨迹上植入 {num_obs} 个随机障碍物')
+
     episode_map  = base_env.map_obstacle.copy()
     episode_path = base_env.poly_points_np.copy() if base_env.poly_points_np is not None else None
 
@@ -270,7 +286,7 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
 
         res = base_env.INTERNAL_RESOLUTION
 
-        map_img = ax_m.imshow(1 - base_env.map_obstacle, cmap='gray', origin='upper', vmin=0, vmax=1)
+        ax_m.imshow(1 - base_env.map_obstacle, cmap='gray', origin='upper')
         if base_env.poly_points_np is not None:
             p = base_env.poly_points_np
             ax_m.plot(p[:, 0] / res, p[:, 1] / res, 'g--', linewidth=1.5, alpha=0.6, label='Ref Path')
@@ -284,7 +300,7 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
         traj_line = LineCollection([], cmap='jet', norm=mcolors.Normalize(vmin=0, vmax=8), linewidth=3.0, zorder=10)
         ax_m.add_collection(traj_line)
         
-        pred_line, = ax_m.plot([], [], color='m', linestyle='-', linewidth=2, alpha=0.8, label='MPC Pred', zorder=20)
+        pred_line, = ax_m.plot([], [], color='m', linestyle='-', linewidth=2, alpha=0.8, label='MPC Pred')
 
         poly_patches = []
         ell_patches = []
@@ -316,7 +332,7 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
         ax_m.legend(loc='upper right', fontsize=8)
 
         render_objs = {
-            'fig': fig, 'ax_m': ax_m, 'map_img': map_img,
+            'fig': fig, 'ax_m': ax_m,
             'traj_line': traj_line, 'car_patch': car_patch, 
             'pred_line': pred_line,       
             'poly_patches': poly_patches, 
@@ -327,88 +343,24 @@ def run_episode(env, base_env, fixed_action: np.ndarray, render: bool, ep_idx: i
             'wheel_rl': wheel_rl, 'wheel_rr': wheel_rr
         }
 
-    last_obs_step = 0
-    moving_obstacles = []
-    clean_map = base_env.map_obstacle.copy()
-
     while not done:
-        # Dynamic injection & moving updates
-        if getattr(base_env, 'use_obstacles', False) and base_env.poly_points_np is not None:
-            # 1. Update positions of existing moving obstacles
-            dt = 0.1  # Assume 0.1s step time for moving obstacles
-            alive_obstacles = []
-            for m_obs in moving_obstacles:
-                m_obs['pos'][0] += m_obs['vel'][0] * dt
-                m_obs['pos'][1] += m_obs['vel'][1] * dt
-                # Keep obstacle if it's still somewhat near the car (e.g. within 50m)
-                if np.linalg.norm(m_obs['pos'] - base_env.state[:2]) < 50.0:
-                    alive_obstacles.append(m_obs)
-            moving_obstacles = alive_obstacles
-
-            # 2. Spawn new moving obstacles
-            if step - last_obs_step >= 25:
-                cx_m, cy_m = base_env.state[0], base_env.state[1]
-                path_pts = base_env.poly_points_np
-                dists = ((path_pts[:, 0] - cx_m)**2 + (path_pts[:, 1] - cy_m)**2)**0.5
-                closest_idx = np.argmin(dists)
-                
-                lookahead_m = np.random.uniform(15.0, 20.0)
-                target_idx = closest_idx
-                accum = 0.0
-                for i in range(closest_idx, len(path_pts) - 1):
-                    accum += np.linalg.norm(path_pts[i+1] - path_pts[i])
-                    if accum >= lookahead_m:
-                        target_idx = i
-                        break
-                        
-                if target_idx > closest_idx + 5 and target_idx < len(path_pts) - 5:
-                    target_pt = path_pts[target_idx]
-                    
-                    # Random velocity for the obstacle (speed 1 to 2.5 m/s)
-                    angle = np.random.uniform(0, 2 * np.pi)
-                    speed = np.random.uniform(1.0, 2.5)
-                    vx, vy = speed * np.cos(angle), speed * np.sin(angle)
-                    
-                    r_px = np.random.randint(4, 9)
-                    
-                    moving_obstacles.append({
-                        'pos': np.array([target_pt[0], target_pt[1]], dtype=np.float32),
-                        'vel': np.array([vx, vy], dtype=np.float32),
-                        'r_px': r_px
-                    })
-                    print(f"[Moving Obs] 注入新移动障碍物！距离 {lookahead_m:.1f} m，速度 {speed:.2f} m/s")
-                    last_obs_step = step
-
-            # 3. Redraw map
-            base_env.map_obstacle[:] = clean_map[:]
-            h, w = base_env.map_obstacle.shape
-            res = base_env.INTERNAL_RESOLUTION
-            for m_obs in moving_obstacles:
-                tx_px, ty_px = int(m_obs['pos'][0] / res), int(m_obs['pos'][1] / res)
-                r_px = m_obs['r_px']
-                y_grid, x_grid = np.ogrid[-ty_px:h-ty_px, -tx_px:w-tx_px]
-                mask = x_grid*x_grid + y_grid*y_grid <= r_px*r_px
-                # Avoid out of bounds issues if mask goes outside
-                try:
-                    base_env.map_obstacle[mask] = 1
-                except Exception:
-                    pass  # out of bounds, skip rendering it
-
         terminated, truncated, infos = env.step(fixed_action)
         done = terminated or truncated
         step += 1
         if 'time_stats' in infos:
             t_stats = infos['time_stats']
-            nn_t = t_stats.get('nn_inference_time', 0.0)
-            poly_t = t_stats.get('polygon_generation_time', 0.0)
+            batch_call_t = t_stats.get('cpp_batch_call_time', t_stats.get('nn_inference_time', 0.0))
+            post_t = t_stats.get('python_postprocess_time', t_stats.get('polygon_generation_time', 0.0))
+            corridor_t = t_stats.get('total_corridor_time', batch_call_t + post_t)
             solve_t = t_stats.get('solve_time', 0.0)
             mat_t = t_stats.get('matrix_build_time', 0.0)
             tot_t = t_stats.get('total_time', 0.0)
             print(f"[Execution Time Stats - Step {step}]")
-            print(f"  -> NN Inference (cumulative): {nn_t*1000:.1f} ms")
-            print(f"  -> Polygon Generation (cumulative): {poly_t*1000:.1f} ms")
-            print(f"  -> Matrix Build Time (including NN & Poly): {mat_t*1000:.1f} ms")
-            print(f"  -> MPC/HPIPM Solve Time: {solve_t*1000:.1f} ms")
+            print(f"  -> Batch Call (cumulative): {batch_call_t*1000:.1f} ms")
+            print(f"  -> Python Postprocess (cumulative): {post_t*1000:.1f} ms")
+            print(f"  -> Corridor Total (cumulative): {corridor_t*1000:.1f} ms")
+            print(f"  -> Matrix Build Time (including corridor): {mat_t*1000:.1f} ms")
+            print(f"  -> MPC Solve Time: {solve_t*1000:.1f} ms")
             print(f"  => Total Step Planner Time: {tot_t*1000:.1f} ms\n")
 
         st = base_env.state
@@ -476,10 +428,9 @@ def main():
     parser.add_argument('--no-render', action='store_true', help='关闭实时展示')
     parser.add_argument('--density', type=float, default=1, help='障碍物采样密度 [0,1]，默认 0.5')
     parser.add_argument('--v-ref', type=float, default=10.0, help='指定基线测试的目标车速 v_ref')
-    parser.add_argument('--w-obs', type=float, default=10.0, help='避障权重乘子')
+    parser.add_argument('--w-obs', type=float, default=4.0, help='避障权重乘子')
     parser.add_argument('--r-inf', type=float, default=1.0, help='障碍影响半径 R_influence')
-    parser.add_argument('--w-lat', type=float, default=4.0, help='横向跟踪权重乘子')
-    parser.add_argument('--w-lon', type=float, default=5.0, help='纵向跟踪权重乘子')
+    parser.add_argument('--w-lat', type=float, default=20.0, help='横向跟踪权重乘子')
     parser.add_argument('--w-steer', type=float, default=1.0, help='方向盘变化率惩罚权重')
     parser.add_argument('--save-video', action='store_true', help='是否保存视频')
     parser.add_argument('--backend', choices=['python', 'cpp'], default='cpp', help='选择 Neural-IRIS 后端')
@@ -502,7 +453,6 @@ def main():
         args.w_obs,         
         args.r_inf,        
         args.w_lat,        
-        args.w_lon,
         args.w_steer,                 
     ], dtype=np.float32)
 

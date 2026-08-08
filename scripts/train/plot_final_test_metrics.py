@@ -92,7 +92,7 @@ def build_normalized_box_stats(metrics):
         ("Axis Error\n/ 128 px", "axis_error_px", PATCH_SIZE, "#e45756", False),
         ("Angle Error\n/ 90 deg", "angle_error_deg", ANGLE_RANGE_DEG, "#7b6fd0", False),
         ("Overlap Error\n(1 - IoU)", "iou_percent", 100.0, "#2e8b57", True),
-        ("Collision Ratio\n(collided only)", "collision_area_percent_collided", 100.0, "#e08d2d", False),
+        ("Collision Area Ratio\n(collided only)", "collision_area_percent_collided", 100.0, "#e08d2d", False),
     ]
     required_suffixes = ["q1", "median", "q3"]
     missing = [
@@ -274,7 +274,7 @@ def save_plot(metrics, output_path):
     fig.suptitle("Normalized Final Test Metrics", y=0.985, fontsize=20)
     top_text = (
         f"N={sample_count} | Collision Rate: {metrics['collision_rate']:.2f}% | Collided Samples: {collision_count}/{sample_count}\n"
-        f"Overlap Error = 1 - IoU | Collision Ratio = collision area / predicted ellipse area\n"
+        f"Overlap Error = 1 - IoU | Collision Area Ratio = collision area / predicted ellipse area\n"
         f"Whiskers: {outlier_iqr_multiplier:.1f} IQR | Dots: sampled outliers"
     )
     fig.text(0.5, 0.945, top_text, ha="center", va="top", fontsize=14.6, color="#555555")

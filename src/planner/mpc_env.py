@@ -9,6 +9,7 @@ if root_path not in sys.path:
     sys.path.append(root_path)
 
 from src.planner.bfs_path import find_random_path_bfs
+from src.planner.config_utils import get_planner_settings, get_vehicle_parameters
 
 
 def get_guide_point_at_s(target_s, path_points, cumulative_dists, total_len):
@@ -54,9 +55,8 @@ def simulate_guided_motion(current_s, path_points, cumulative_dists, velocity, s
     return positions, angles
 
 class MPCEnv:
-    def __init__(self, map_obstacle, max_steps=1000, input_resolution=1.0, path_mode="train", planner_mode="constrained"):
+    def __init__(self, map_obstacle, max_steps=1000, input_resolution=1.0, path_mode="train", planner_mode=None):
         self.path_mode = path_mode
-        self.planner_mode = planner_mode
         self.lidar_path_shortcut = None
         self.input_resolution = float(input_resolution)
         self.max_steps = max_steps
@@ -101,11 +101,20 @@ class MPCEnv:
         self.history_trajectory = []
         self.cached_dist_map = None
 
+        planner_cfg = get_planner_settings()
+        if planner_mode is None:
+            planner_mode = planner_cfg['solver']
+        else:
+            planner_mode = str(planner_mode).lower()
+
+        if planner_mode not in {"hpipm", "osqp"}:
+            raise ValueError(f"Unsupported planner_mode: {planner_mode}")
+
+        self.planner_mode = planner_mode
+        self.planner_interface = planner_cfg['neural_iris_interface']
+
         # mpc_env setup
-        import os, json
-        config_path = os.path.join(os.path.dirname(__file__), '..', '..', 'config', 'config.json')
-        with open(config_path, 'r', encoding='utf-8') as f:
-            cfg = json.load(f)['vehicle_parameters']
+        cfg = get_vehicle_parameters()
         
         self.veh_wheelbase = cfg['wheelbase_m']
         self.veh_width = cfg['car_width_m']
@@ -115,13 +124,17 @@ class MPCEnv:
         
         self.veh_circle_radius = np.hypot(self.veh_wheelbase / 2, self.veh_width / 2)
 
-        if planner_mode == "constrained":
+        if planner_mode == "hpipm":
             from src.planner.planner import Planner
-        elif planner_mode == "unconstrained":
-            from src.planner.planner_unconstrained import Planner
-        else:
-            raise ValueError(f"Unsupported planner_mode: {planner_mode}")
+        elif planner_mode == "osqp":
+            from src.planner.planner_osqp import Planner
         self.planner = Planner(sample_time=self.dt, horizon_steps=20, veh_wheelbase=self.veh_wheelbase)
+        cpp_available = bool(getattr(self.planner, 'use_cpp_neural_iris', False))
+        if self.planner_interface == "cpp" and not cpp_available:
+            print("[Planner] C++ Neural-IRIS interface is not available, falling back to Python.")
+        self.planner.use_cpp_neural_iris = self.planner_interface == "cpp" and cpp_available
+        self.planner.requested_neural_iris_interface = self.planner_interface
+        self.planner.neural_iris_interface = "cpp" if self.planner.use_cpp_neural_iris else "python"
         self.planner.set_bounds(
             pos_ub=np.array([self.map_width_m, self.map_height_m]),
             v_min=-10.0, v_max=10.0,

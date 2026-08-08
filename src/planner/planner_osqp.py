@@ -4,7 +4,12 @@ import os
 import sys
 import time
 import cv2
+import scipy.sparse as sp
 from scipy.spatial import cKDTree
+try:
+    import osqp
+except Exception:
+    osqp = None
 
 
 # --- 路径处理 ---
@@ -20,14 +25,18 @@ try:
     from cpp.python import infer_safe_region_batch_halfspaces as cpp_infer_safe_region_batch_halfspaces
 except Exception:
     cpp_infer_safe_region_batch_halfspaces = None
-from hpipm_python import (hpipm_ocp_qp_dim, hpipm_ocp_qp,
-                          hpipm_ocp_qp_sol, hpipm_ocp_qp_solver_arg, hpipm_ocp_qp_solver)
 
 # =========================================================
 # 2. MPC 规划器主体
 # =========================================================
 class Planner:
     def __init__(self, sample_time: float, horizon_steps: int, veh_wheelbase=2.0):
+        if osqp is None:
+            raise ImportError(
+                "planner_osqp requires the `osqp` package. "
+                "Install it with `pip install osqp`."
+            )
+
         # ==========================================
         # 1. 基础系统与维度参数 (System & Dimensions)
         # ==========================================
@@ -94,37 +103,18 @@ class Planner:
         os.environ.setdefault("NEURAL_IRIS_CPP_BACKEND", "gpu")
         self.use_cpp_neural_iris = cpp_infer_safe_region_batch_halfspaces is not None
         self.patch_size = 128
-        
-        # 初始化 HPIPM (高性能内点法) QP 求解器
-        self.qp_problem, self.qp_solution, self.qp_solver = self._create_hpipm_solver()
-
-    def _create_hpipm_solver(self):
-        """
-        初始化 HPIPM 求解器的内存维度和算法参数。
-        """
-        dims = hpipm_ocp_qp_dim(self.horizon_steps)
-        dims.set('nx', self.nx, 0, self.horizon_steps)
-        dims.set('nu', self.nu, 0, self.horizon_steps - 1)
-        dims.set('nbx', self.nx, 0, self.horizon_steps) 
-        dims.set('nbu', self.nu, 0, self.horizon_steps - 1) 
-
-        # 使用一般线性约束 ng = self.N_faces 来限制安全多边形
-        dims.set('ng', self.N_faces, 0, self.horizon_steps - 1) 
-        
-        qp_problem = hpipm_ocp_qp(dims)
-        qp_solution = hpipm_ocp_qp_sol(dims)
-        
-        # speed_abs 模式: 牺牲部分极端精度换取极速求解
-        solver_arg = hpipm_ocp_qp_solver_arg(dims, 'speed_abs')
-        solver_arg.set('mu0', 1e1)
-        solver_arg.set('iter_max', 50) 
-        solver_arg.set('tol_stat', 1e-3)
-        solver_arg.set('tol_eq', 1e-3)
-        solver_arg.set('tol_ineq', 1e-3)
-        solver_arg.set('tol_comp', 1e-3)
-
-        qp_solver = hpipm_ocp_qp_solver(dims, solver_arg)
-        return qp_problem, qp_solution, qp_solver
+        self.state_lower_bound = None
+        self.state_upper_bound = None
+        self.input_lower_bound = None
+        self.input_upper_bound = None
+        self.osqp_settings = {
+            'verbose': False,
+            'warm_start': True,
+            'polish': False,
+            'eps_abs': 1e-3,
+            'eps_rel': 1e-3,
+            'max_iter': 4000,
+        }
 
     def set_bounds(self, pos_lb=None, pos_ub=None, 
                    v_min=-10.0, v_max=10.0, 
@@ -153,17 +143,10 @@ class Planner:
         for i in range(self.nu_orig, self.nu):
             input_lower_bound[i, 0] = 0.0
             input_upper_bound[i, 0] = 1e5
-
-        # 遍历预测域应用边界约束
-        for k in range(self.horizon_steps + 1):
-            self.qp_problem.set('Jbx', np.eye(self.nx), k) 
-            if k > 0:
-                self.qp_problem.set('lbx', state_lower_bound, k)
-                self.qp_problem.set('ubx', state_upper_bound, k)
-            if k < self.horizon_steps:
-                self.qp_problem.set('Jbu', np.eye(self.nu), k) 
-                self.qp_problem.set('lbu', input_lower_bound, k)
-                self.qp_problem.set('ubu', input_upper_bound, k)
+        self.state_lower_bound = state_lower_bound.reshape(-1)
+        self.state_upper_bound = state_upper_bound.reshape(-1)
+        self.input_lower_bound = input_lower_bound.reshape(-1)
+        self.input_upper_bound = input_upper_bound.reshape(-1)
 
     def _build_local_kdtree(self, occupancy_map, ego_state, map_resolution, radius=30.0):
         """
@@ -614,6 +597,120 @@ class Planner:
             mpc_stage_dict[k] = stage
 
         return mpc_stage_dict, sum_batch_call_time, sum_python_postprocess_time, sum_total_corridor_time
+
+    def _state_slice(self, step_index: int):
+        start = step_index * self.nx
+        return slice(start, start + self.nx)
+
+    def _control_slice(self, step_index: int):
+        ctrl_offset = self.nx * (self.horizon_steps + 1)
+        start = ctrl_offset + step_index * self.nu
+        return slice(start, start + self.nu)
+
+    def _build_osqp_problem(self, initial_state, mpc_stage_dict, x_guess, u_guess_padded):
+        if self.state_lower_bound is None or self.input_lower_bound is None:
+            self.set_bounds()
+
+        num_x = self.nx * (self.horizon_steps + 1)
+        num_u = self.nu * self.horizon_steps
+        num_vars = num_x + num_u
+
+        P_blocks = []
+        q_blocks = []
+        for k in range(self.horizon_steps + 1):
+            P_blocks.append(sp.csc_matrix(np.asarray(mpc_stage_dict[k]['Qk'], dtype=float)))
+            q_blocks.append(np.asarray(mpc_stage_dict[k]['fk'], dtype=float).reshape(-1))
+        for k in range(self.horizon_steps):
+            P_blocks.append(sp.csc_matrix(np.asarray(mpc_stage_dict[k]['Rk'], dtype=float)))
+            q_blocks.append(np.asarray(mpc_stage_dict[k]['rk'], dtype=float).reshape(-1))
+
+        P = sp.block_diag(P_blocks, format='csc')
+        P = sp.triu((P + P.T) * 0.5, format='csc')
+        q = np.concatenate(q_blocks)
+
+        constraint_rows = []
+        lower_bounds = []
+        upper_bounds = []
+
+        init_row = sp.lil_matrix((self.nx, num_vars))
+        init_row[:, self._state_slice(0)] = np.eye(self.nx)
+        constraint_rows.append(init_row.tocsc())
+        init_state = np.asarray(initial_state, dtype=float).reshape(-1)
+        lower_bounds.append(init_state)
+        upper_bounds.append(init_state)
+
+        for k in range(self.horizon_steps):
+            x_ref_k = np.asarray(x_guess[:, k], dtype=float)
+            u_ref_k = np.asarray(u_guess_padded[:self.nu_orig, k], dtype=float)
+            Ad, Bd_orig, cd = self.model.get_linearized_matrices(x_ref_k, u_ref_k)
+
+            Bd = np.zeros((self.nx, self.nu))
+            Bd[:, :self.nu_orig] = Bd_orig
+
+            dyn_row = sp.lil_matrix((self.nx, num_vars))
+            dyn_row[:, self._state_slice(k)] = -Ad
+            dyn_row[:, self._state_slice(k + 1)] = np.eye(self.nx)
+            dyn_row[:, self._control_slice(k)] = -Bd
+            constraint_rows.append(dyn_row.tocsc())
+            cd_vec = np.asarray(cd, dtype=float).reshape(-1)
+            lower_bounds.append(cd_vec)
+            upper_bounds.append(cd_vec)
+
+        state_selector = sp.eye(self.nx, format='csc')
+        for k in range(1, self.horizon_steps + 1):
+            state_row = sp.lil_matrix((self.nx, num_vars))
+            state_row[:, self._state_slice(k)] = state_selector
+            constraint_rows.append(state_row.tocsc())
+            lower_bounds.append(self.state_lower_bound.copy())
+            upper_bounds.append(self.state_upper_bound.copy())
+
+        input_selector = sp.eye(self.nu, format='csc')
+        for k in range(self.horizon_steps):
+            input_row = sp.lil_matrix((self.nu, num_vars))
+            input_row[:, self._control_slice(k)] = input_selector
+            constraint_rows.append(input_row.tocsc())
+            lower_bounds.append(self.input_lower_bound.copy())
+            upper_bounds.append(self.input_upper_bound.copy())
+
+            if 'C_mat' not in mpc_stage_dict[k]:
+                continue
+
+            C_mat = np.asarray(mpc_stage_dict[k]['C_mat'], dtype=float)
+            D_mat = np.asarray(mpc_stage_dict[k]['D_mat'], dtype=float)
+            lg = np.asarray(mpc_stage_dict[k]['lg'], dtype=float).reshape(-1)
+            ug = np.asarray(mpc_stage_dict[k]['ug'], dtype=float).reshape(-1)
+            lg_mask = np.asarray(
+                mpc_stage_dict[k].get('lg_mask', np.ones_like(lg).reshape(-1, 1)),
+                dtype=float,
+            ).reshape(-1)
+            ug_mask = np.asarray(
+                mpc_stage_dict[k].get('ug_mask', np.ones_like(ug).reshape(-1, 1)),
+                dtype=float,
+            ).reshape(-1)
+
+            gen_row = sp.lil_matrix((C_mat.shape[0], num_vars))
+            gen_row[:, self._state_slice(k)] = C_mat
+            gen_row[:, self._control_slice(k)] = D_mat
+            constraint_rows.append(gen_row.tocsc())
+
+            lower = np.full(C_mat.shape[0], -np.inf, dtype=float)
+            upper = np.full(C_mat.shape[0], np.inf, dtype=float)
+            lower[lg_mask > 0.5] = lg[lg_mask > 0.5]
+            upper[ug_mask > 0.5] = ug[ug_mask > 0.5]
+            lower_bounds.append(lower)
+            upper_bounds.append(upper)
+
+        A = sp.vstack(constraint_rows, format='csc')
+        l = np.concatenate(lower_bounds)
+        u = np.concatenate(upper_bounds)
+
+        warm_start = np.zeros(num_vars, dtype=float)
+        for k in range(self.horizon_steps + 1):
+            warm_start[self._state_slice(k)] = np.asarray(x_guess[:, k], dtype=float)
+        for k in range(self.horizon_steps):
+            warm_start[self._control_slice(k)] = np.asarray(u_guess_padded[:, k], dtype=float)
+
+        return P, q, A, l, u, warm_start
     
     def step_once(self, current_state: np.ndarray, last_ctrl: np.ndarray, guesses: tuple,
                   map_obstacle: np.ndarray, guided_points: dict,
@@ -669,7 +766,7 @@ class Planner:
         t_end_matrix = time.time()
         
         t_start_solve = time.time()
-        U_opt, X_opt, info = self.solve_with_hpipm(
+        U_opt, X_opt, info = self.solve_with_osqp(
             s0.reshape(-1, 1), mpc_stage_dict, x_guess=X_guess, u_guess=U_guess
         )
         t_end_solve = time.time()
@@ -710,70 +807,59 @@ class Planner:
         
         return next_state, next_ctrl_safe, X_next_guess, U_next_guess, info
 
-    def solve_with_hpipm(self, initial_state, mpc_stage_dict, x_guess=None, u_guess=None):
-        self.qp_problem.set('lbx', initial_state, 0)
-        self.qp_problem.set('ubx', initial_state, 0)
-         
+    def solve_with_osqp(self, initial_state, mpc_stage_dict, x_guess=None, u_guess=None):
         if x_guess is None:
             x_guess = np.tile(initial_state, (1, self.horizon_steps + 1))
-        
-        # 将传入的原生 Guess(2D) 转换为扩充后的求解器所需 Guess(4D)
+
         u_guess_padded = np.zeros((self.nu, self.horizon_steps))
         if u_guess is not None:
             u_guess_padded[:self.nu_orig, :] = u_guess[:self.nu_orig, :]
-            
-        for k in range(self.horizon_steps + 1):
-            x_ref_k = x_guess[:, k]
-            
-            if k < self.horizon_steps:
-                # 只有原始控制量传入给动力学系统
-                u_ref_k = u_guess_padded[:self.nu_orig, k]
-                Ad, Bd_orig, cd = self.model.get_linearized_matrices(x_ref_k, u_ref_k)
 
-                # 将动力学 Bd 矩阵补充至 4 列，确保求解器改动 s1 s2 时完全不影响下一帧状态转移
-                Bd = np.zeros((self.nx, self.nu))
-                Bd[:, :self.nu_orig] = Bd_orig
+        P, q, A, l, u, warm_start = self._build_osqp_problem(
+            initial_state,
+            mpc_stage_dict,
+            x_guess,
+            u_guess_padded,
+        )
 
-                self.qp_problem.set('A', Ad, k)
-                self.qp_problem.set('B', Bd, k)
-                self.qp_problem.set('b', cd.reshape(-1, 1), k) 
-                
-                self.qp_problem.set('R', mpc_stage_dict[k]['Rk'], k)
-                self.qp_problem.set('r', mpc_stage_dict[k]['rk'], k)
-                self.qp_solution.set('u', u_guess_padded[:, k], k)
-                
-                if 'C_mat' in mpc_stage_dict[k]:
-                    self.qp_problem.set('C', mpc_stage_dict[k]['C_mat'], k)
-                    self.qp_problem.set('D', mpc_stage_dict[k]['D_mat'], k)
-                    self.qp_problem.set('lg', mpc_stage_dict[k]['lg'], k)
-                    self.qp_problem.set('ug', mpc_stage_dict[k]['ug'], k)
-                    self.qp_problem.set('lg_mask', mpc_stage_dict[k]['lg_mask'], k)
-                    self.qp_problem.set('ug_mask', mpc_stage_dict[k]['ug_mask'], k)
-            
-            self.qp_problem.set('Q', mpc_stage_dict[k]['Qk'], k)
-            self.qp_problem.set('q', mpc_stage_dict[k]['fk'].reshape(-1, 1), k)
-            self.qp_solution.set('x', x_guess[:, k], k)
+        solver = osqp.OSQP()
+        solver.setup(P=P, q=q, A=A, l=l, u=u, **self.osqp_settings)
+        solver.warm_start(x=warm_start)
 
         try:
-            self.qp_solver.solve(self.qp_problem, self.qp_solution)
-            status = self.qp_solver.get('status')
-            if status != 0:
-                print(f"[MPC Warn] HPIPM solver returned status = {status}")
+            result = solver.solve()
         except Exception as e:
-            print(f"[MPC Error] HPIPM solve crash: {e}")
-            
-        # 从求解器分离返回的最优序列，抛弃优化用的松弛变量，仅保留机械指令
+            print(f"[MPC Error] OSQP solve crash: {e}")
+            result = None
+
         u_opt = np.zeros((self.nu_orig, self.horizon_steps))
         x_opt = np.zeros((self.nx, self.horizon_steps + 1))
-        
+
+        if result is None or result.x is None:
+            z_opt = warm_start
+            status = 'solve_failed'
+            status_val = -1
+            obj_val = np.nan
+        else:
+            z_opt = result.x
+            status = result.info.status
+            status_val = result.info.status_val
+            obj_val = result.info.obj_val
+            if status_val not in (1, 2):
+                print(f"[MPC Warn] OSQP solver returned status = {status}")
+
         for k in range(self.horizon_steps):
-            full_u = self.qp_solution.get('u', k).flatten()
+            full_u = z_opt[self._control_slice(k)]
             u_opt[:, k] = full_u[:self.nu_orig]
-            
+
         for k in range(self.horizon_steps + 1):
-            x_opt[:, k] = self.qp_solution.get('x', k).flatten()
-        
-        info = {'status': self.qp_solver.get('status')}
+            x_opt[:, k] = z_opt[self._state_slice(k)]
+
+        info = {
+            'status': status,
+            'status_val': status_val,
+            'objective': obj_val,
+        }
         return u_opt, x_opt, info
 
     def horizon_forward_step(self, state_traj, control_traj, current_state):

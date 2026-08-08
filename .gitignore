@@ -47,5 +47,13 @@ experiment/metrics_results/*.csv
 experiment/metrics_results/*.txt
 !experiment/metrics_results/parameter_metrics_summary_merged.txt
 
+# Inference demo outputs
+inference_results/
+
+# Personal working notes / paper source (keep out of the public repo)
+Neural-IRIS：面向局部轨迹规划的快速无障碍凸区域生成方法.docx
+参考文献整理.md
+引用文献整理.md
+
 # third_party
 third_party/

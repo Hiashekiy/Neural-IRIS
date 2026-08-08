@@ -1,7 +1,8 @@
 import numpy as np
 import os
+import argparse
 
-def split_and_save_dataset(input_file, out_dir="data/splits", train_ratio=0.8, val_ratio=0.1):
+def split_and_save_dataset(input_file, out_dir="data/iris-dataset/splits", train_ratio=0.8, val_ratio=0.1):
     print(f"Loading full dataset from {input_file}...")
     data = np.load(input_file)
     patches = data['patches']
@@ -46,4 +47,18 @@ def split_and_save_dataset(input_file, out_dir="data/splits", train_ratio=0.8, v
     print("="*40)
 
 if __name__ == "__main__":
-    split_and_save_dataset("data/filtered_iris_dataset.npz")
+    parser = argparse.ArgumentParser(description="Split filtered IRIS dataset into train/val/test")
+    parser.add_argument(
+        "--input",
+        type=str,
+        default="data/iris-dataset/filtered_iris_dataset.npz",
+        help="Path to the filtered dataset npz.",
+    )
+    parser.add_argument(
+        "--out-dir",
+        type=str,
+        default="data/iris-dataset/splits",
+        help="Directory to save train/val/test splits.",
+    )
+    args = parser.parse_args()
+    split_and_save_dataset(args.input, out_dir=args.out_dir)
