@@ -268,6 +268,12 @@ A, b, P, c = infer_safe_region_halfspaces(obs_mask)
 
 实验脚本位于 `scripts/demo/`，用于验证 Neural-IRIS 生成的凸区域作为 MPC 线性安全约束的效果。该实验在仿真过程中每隔一段时间在车辆前方路径上**在线注入新的静态障碍物**，检验 MPC 能否结合实时占据地图与 Neural-IRIS 半空间约束完成避障：
 
+MPC 闭环实验效果演示：
+
+<video src="assets/mpc-neural-iris.mp4" controls="controls" muted="muted" style="max-width: 100%;"></video>
+
+> 如果此处无法播放，可下载 [mpc-neural-iris.mp4](assets/mpc-neural-iris.mp4)。
+
 ```bash
 python scripts/demo/mpc-neural-iris.py --map random --episodes 5 --no-render --backend python
 ```
